@@ -20,7 +20,7 @@
 ##   * an explicit `close` is not an outage: nothing reconnects.
 
 import std/[os, strutils, times, unittest]
-import nats/conn as core
+import natsnim/conn as core
 import busharness
 
 proc fastOpts(maxReconnects = 30, waitMs = 50, bufSize = 8 * 1024 * 1024,

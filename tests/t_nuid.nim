@@ -7,7 +7,7 @@
 ## unchanged.
 
 import std/[sets, unittest]
-import nats/nuid
+import natsnim/nuid
 
 suite "nuid":
 

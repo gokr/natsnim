@@ -15,7 +15,7 @@
 ##   * HMSG from a raw `HPUB` peer is split into headers + body.
 
 import std/[net, os, osproc, sets, strutils, times, unittest]
-import nats/conn as core
+import natsnim/conn as core
 import busharness
 
 
@@ -80,6 +80,31 @@ proc runTests(url: string, port: int) =
       let m = b.nextMsg(0)              # ...and B's message is already queued
       check m.data == "for-b"
 
+    test "a 1 ms timeout still reads an available message":
+      # Regression: with a 1 ms budget, `inMilliseconds` truncates the
+      # remaining time to 0, so an "out of budget" early return made the whole
+      # call a no-op — the socket was never read. Components pump at 25 ms
+      # (unaffected); a 1 ms poll is what Niffler's core registry uses, and it
+      # silently never saw registrations.
+      let c = core.dial(url)
+      let pub = core.dial(url)
+      defer:
+        c.close()
+        pub.close()
+      let sub = c.subscribe("t.one")
+      c.flush()
+      pub.publish("t.one", "x")
+      pub.flush()                    # the message is in our socket now
+      check sub.nextMsg(1).data == "x"        # must read, not time out
+      pub.publish("t.one", "y")
+      pub.flush()
+      check sub.nextMsg(1).data == "y"
+      # and an empty 1 ms poll still returns promptly with a timeout
+      let t0 = epochTime()
+      expect core.NatsTimeout:
+        discard sub.nextMsg(1)
+      check epochTime() - t0 < 0.5
+
     test "coalesced frames from one read are all delivered":
       let c = core.dial(url)
       defer: c.close()
@@ -133,6 +158,29 @@ proc runTests(url: string, port: int) =
       var uniq = initHashSet[string]()
       for g in got: uniq.incl g
       check uniq.len == 9        # each message delivered exactly once
+
+    test "a wildcard subscription receives matching subjects":
+      # Core's component registry is `reg.>`; Niffler's console uses `>`.
+      # The server does the matching, so this is really a test that our SUB
+      # frame is well formed and that routing by sid works for wildcards.
+      let c = core.dial(url)
+      defer: c.close()
+      let reg = c.subscribe("reg.>")
+      let all = c.subscribe(">")
+      c.flush()
+      c.publish("reg.publish", "reg-event")
+      c.publish("other.topic", "other-event")
+      c.flush()
+      let m = reg.nextMsg(1000)
+      check m.subject == "reg.publish"
+      check m.data == "reg-event"
+      # `>` sees both, but not itself-once-more: exactly two messages
+      var seen: seq[string]
+      for _ in 0 ..< 2:
+        seen.add all.nextMsg(1000).subject
+      check seen == @["reg.publish", "other.topic"]
+      expect core.NatsTimeout:
+        discard reg.nextMsg(50)
 
     test "two subscribers on the same subject both receive (fan-out)":
       let c = core.dial(url)

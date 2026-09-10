@@ -13,7 +13,7 @@
 
 import std/[net, os, osproc, strutils, times]
 
-import nats/conn as core
+import natsnim/conn as core
 
 type
   TestServer* = object

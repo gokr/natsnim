@@ -17,7 +17,7 @@ and wiring Niffler onto it (P7). See the phase plan in
 [ASSESSMENT.md](ASSESSMENT.md#plan).
 
 ```nim
-import nats            # the natswrapper-shaped surface
+import natsnim         # the natswrapper-shaped surface
 
 var nc = connect("nats://127.0.0.1:4222")
 defer: nc.close()
@@ -32,7 +32,7 @@ if natsSubscription_NextMsg(addr msg, sub, 1000) == NATS_OK:
 The idiomatic API lives in `nats/conn` and is what the shim is built on:
 
 ```nim
-import nats/conn as natsconn
+import natsnim/conn as natsconn
 let c = natsconn.dial("nats://127.0.0.1:4222")
 let sub = c.subscribe("ev.>")
 c.publish("ev.thing", "hello")
@@ -124,7 +124,7 @@ bytes, and HMSG from a raw `HPUB` peer.
 ## Implementation notes
 
 Two Nim details are load-bearing and cost real debugging time; both are
-documented at the call site in `src/nats/conn.nim`:
+documented at the call site in `src/natsnim/conn.nim`:
 
 1. **The socket must be unbuffered.** `newSocket()` is buffered, and Nim's
    buffered `recv(fd, size)` loops until it has filled the whole request — so

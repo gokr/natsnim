@@ -11,7 +11,7 @@
 ##     failure is `NATS_ERR` with a message from `getErrorString`.
 
 import std/[os, osproc, strutils, times, unittest]
-import nats
+import natsnim
 import busharness
 
 proc bytesOf(msg: ptr natsMsg): string =
@@ -53,7 +53,7 @@ proc runTests(url: string) =
       check $natsMsg_GetData(msg) == "payload"
       natsMsg_Destroy(msg)
       check natsConnection_GetMaxPayload(nc.conn) == 1024
-      check natsSubscription_Destroy(sub) == NATS_OK
+      natsSubscription_Destroy(sub)
 
     test "natsConnection_Flush does a PING/PONG round trip":
       var nc = connect(url)
@@ -68,7 +68,7 @@ proc runTests(url: string) =
       var msg: ptr natsMsg
       check natsSubscription_NextMsg(addr msg, sub, 0) == NATS_OK
       check $natsMsg_GetData(msg) == "x"
-      discard natsSubscription_Destroy(sub)
+      natsSubscription_Destroy(sub)
 
     test "QueueSubscribeSync shares one message across the group":
       var nc = connect(url)
@@ -87,8 +87,8 @@ proc runTests(url: string) =
       if natsSubscription_NextMsg(addr m1, s1, 500) == NATS_OK: inc got
       if natsSubscription_NextMsg(addr m2, s2, 500) == NATS_OK: inc got
       check got == 1                     # exactly one member got it
-      discard natsSubscription_Destroy(s1)
-      discard natsSubscription_Destroy(s2)
+      natsSubscription_Destroy(s1)
+      natsSubscription_Destroy(s2)
 
     test "NextMsg reports a timeout as NATS_TIMEOUT, not as an error":
       var nc = connect(url)
@@ -98,7 +98,7 @@ proc runTests(url: string) =
       check natsConnection_FlushTimeout(nc.conn, 2000) == NATS_OK
       var msg: ptr natsMsg
       check natsSubscription_NextMsg(addr msg, sub, 0) == NATS_TIMEOUT
-      check natsSubscription_Destroy(sub) == NATS_OK
+      natsSubscription_Destroy(sub)
 
     test "PublishRequest/NextMsg carry binary payloads (NUL bytes)":
       # Two connections: a responder would have to be pumped, so drive the
@@ -141,8 +141,8 @@ proc runTests(url: string) =
       check natsSubscription_NextMsg(addr got, rep, 2000) == NATS_OK
       check bytesOf(got) == "\x00reply\x00"
       natsMsg_Destroy(got)
-      discard natsSubscription_Destroy(rep)
-      discard natsSubscription_Destroy(svc)
+      natsSubscription_Destroy(rep)
+      natsSubscription_Destroy(svc)
 
     test "natsConnection_Request end to end (responder process)":
       let resp = startResponder(url, "shim.svc", "echo:")

@@ -7,7 +7,7 @@
 ## Where upstream asserts `ps.argBuf != nil`, this uses `hasArgBuf()`.
 
 import std/[strutils, unittest]
-import nats/parser
+import natsnim/parser
 
 type
   Rec = object

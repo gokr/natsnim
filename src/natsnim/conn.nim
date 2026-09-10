@@ -23,9 +23,9 @@ import std/[deques, json, monotimes, nativesockets, net, os, random, strutils,
             tables, times]
 from std/posix import poll, TPollfd, Tnfds, POLLIN, POLLERR, POLLHUP, POLLNVAL
 
-import nats/parser
-import nats/nuid
-import nats/subject
+import natsnim/parser
+import natsnim/nuid
+import natsnim/subject
 
 const
   defaultConnectTimeoutMs* = 5000
@@ -643,6 +643,12 @@ proc nextMsg*(sub: Subscription, timeoutMs: int): Message =
   ## not wait" (a non-blocking poll, as upstream). Raises `NatsTimeout` when
   ## nothing arrives, `NatsError` if the subscription or connection is closed
   ## or the pending limit was exceeded.
+  ##
+  ## **Every call reads the socket at least once.** That is not an
+  ## optimisation: a 1 ms timeout truncates to 0 ms of remaining budget
+  ## (`inMilliseconds`), and an early "budget spent" break therefore made the
+  ## call a pure no-op — which silently broke a 1 ms poll in a real client
+  ## (Niffler's component registry). Read first, then decide.
   if sub.overrun:
     fail("subscription on '" & sub.subject & "' exceeded its pending limit (" &
          $sub.pendingLimit & " msgs); " & $sub.dropped &
@@ -670,8 +676,7 @@ proc nextMsg*(sub: Subscription, timeoutMs: int): Message =
     var waitMs = 0
     if timed:
       let rem = (deadline - getMonoTime()).inMilliseconds
-      if rem <= 0: break
-      waitMs = rem.int
+      if rem > 0: waitMs = rem.int
     try:
       discard conn.pump(waitMs)
     except NatsError:
@@ -682,6 +687,7 @@ proc nextMsg*(sub: Subscription, timeoutMs: int): Message =
     if sub.msgs.len > 0: return sub.msgs.popFirst()
     if not conn.connected: continue
     if not timed: break
+    if getMonoTime() >= deadline: break
   raise newException(NatsTimeout,
     "no message on '" & sub.subject & "' within " & $timeoutMs & "ms")
 

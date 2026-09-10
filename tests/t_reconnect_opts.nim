@@ -5,8 +5,8 @@
 ## reliably in a test, but the arithmetic that decides it can.
 
 import std/[random, unittest]
-import nats/conn as core
-import nats
+import natsnim/conn as core
+import natsnim
 
 proc opts(waitMs, jitterMs, dialMs, connectMs: int): core.DialOptions =
   result = core.defaultDialOptions()

@@ -13,7 +13,7 @@
 ## needing a read timeout).
 
 import std/[os, strutils]
-import nats/conn as core
+import natsnim/conn as core
 
 proc main() =
   let args = commandLineParams()

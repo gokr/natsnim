@@ -18,8 +18,8 @@
 ## Not thread-safe (see README): one connection per thread.
 
 import std/[json, strutils]
-import nats/parser
-import nats/conn as core
+import natsnim/parser
+import natsnim/conn as core
 
 export core
 
@@ -68,7 +68,7 @@ proc lastError*(): string =
   ## Last shim-level error message ("" when none).
   lastErrorText
 
-proc setErr(msg: string): natsStatus =
+proc setErr(msg: string): natsStatus {.discardable.} =
   lastErrorText = msg
   NATS_ERR
 
@@ -80,7 +80,7 @@ proc cstrToStr(p: cstring, n: cint): string =
 
 # --- library lifecycle ------------------------------------------------------
 
-proc nats_Open*(sleepMs: int): natsStatus =
+proc nats_Open*(sleepMs: int): natsStatus {.discardable.} =
   ## Kept for API compatibility: a pure-Nim client has no global C state to
   ## initialise, and the process-global NUID seeds itself lazily.
   discard sleepMs
@@ -121,7 +121,7 @@ proc rawConn(nc: ptr natsConnection): core.Connection =
   if nc == nil or nc.impl == nil: nil else: nc.impl
 
 proc natsConnection_PublishString*(conn: ptr natsConnection,
-                                   subject, data: cstring): natsStatus =
+                                   subject, data: cstring): natsStatus {.discardable.} =
   let c = rawConn(conn)
   if c == nil: return setErr("natsConnection_PublishString: nil connection")
   try:
@@ -131,7 +131,7 @@ proc natsConnection_PublishString*(conn: ptr natsConnection,
     setErr(e.msg)
 
 proc natsConnection_Publish*(conn: ptr natsConnection, subject: cstring,
-                             data: cstring, dataLen: cint): natsStatus =
+                             data: cstring, dataLen: cint): natsStatus {.discardable.} =
   ## Binary-safe publish (data + length), the counterpart of nats.c's
   ## `natsConnection_Publish`. `PublishString` is NUL-terminated, so a payload
   ## containing NUL bytes must go through here.
@@ -144,7 +144,7 @@ proc natsConnection_Publish*(conn: ptr natsConnection, subject: cstring,
     setErr(e.msg)
 
 proc natsConnection_FlushTimeout*(conn: ptr natsConnection,
-                                  timeoutMs: int64): natsStatus =
+                                  timeoutMs: int64): natsStatus {.discardable.} =
   let c = rawConn(conn)
   if c == nil: return setErr("natsConnection_FlushTimeout: nil connection")
   try:
@@ -156,7 +156,7 @@ proc natsConnection_FlushTimeout*(conn: ptr natsConnection,
   except CatchableError as e:
     setErr(e.msg)
 
-proc natsConnection_Flush*(conn: ptr natsConnection): natsStatus =
+proc natsConnection_Flush*(conn: ptr natsConnection): natsStatus {.discardable.} =
   ## PING/PONG round trip with a bounded wait. Deviation from nats.c, whose
   ## `natsConnection_Flush` blocks until the connection's own default timeout:
   ## this client never waits unbounded (there is no thread to interrupt it), so
@@ -198,21 +198,21 @@ proc subscribeSync(conn: ptr natsConnection, subject: string,
 
 proc natsConnection_SubscribeSync*(sub: ptr ptr natsSubscription,
                                    conn: ptr natsConnection,
-                                   subject: cstring): natsStatus =
+                                   subject: cstring): natsStatus {.discardable.} =
   let (st, handle) = subscribeSync(conn, $subject, "")
   if st == NATS_OK: sub[] = handle
   st
 
 proc natsConnection_QueueSubscribeSync*(sub: ptr ptr natsSubscription,
                                         conn: ptr natsConnection,
-                                        subject, queue: cstring): natsStatus =
+                                        subject, queue: cstring): natsStatus {.discardable.} =
   let (st, handle) = subscribeSync(conn, $subject, $queue)
   if st == NATS_OK: sub[] = handle
   st
 
 proc natsConnection_PublishRequest*(conn: ptr natsConnection,
                                     subject, reply, data: cstring,
-                                    dataLen: cint): natsStatus =
+                                    dataLen: cint): natsStatus {.discardable.} =
   let c = rawConn(conn)
   if c == nil: return setErr("natsConnection_PublishRequest: nil connection")
   try:
@@ -233,7 +233,7 @@ proc msgHandle(m: core.Message): ptr natsMsg =
 
 proc natsConnection_Request*(msg: ptr ptr natsMsg, conn: ptr natsConnection,
                              subject, data: cstring, dataLen: cint,
-                             timeoutMs: int64): natsStatus =
+                             timeoutMs: int64): natsStatus {.discardable.} =
   let c = rawConn(conn)
   if c == nil: return setErr("natsConnection_Request: nil connection")
   try:
@@ -250,7 +250,7 @@ proc natsConnection_Request*(msg: ptr ptr natsMsg, conn: ptr natsConnection,
 
 proc natsSubscription_NextMsg*(msg: ptr ptr natsMsg,
                                sub: ptr natsSubscription,
-                               timeoutMs: int64): natsStatus =
+                               timeoutMs: int64): natsStatus {.discardable.} =
   if sub == nil or sub.impl == nil:
     return setErr("natsSubscription_NextMsg: nil subscription")
   try:
@@ -262,20 +262,25 @@ proc natsSubscription_NextMsg*(msg: ptr ptr natsMsg,
   except CatchableError as e:
     setErr(e.msg)
 
-proc natsSubscription_Unsubscribe*(sub: ptr natsSubscription): natsStatus =
+proc natsSubscription_Unsubscribe*(sub: ptr natsSubscription): natsStatus {.discardable.} =
   if sub == nil or sub.impl == nil:
     return setErr("natsSubscription_Unsubscribe: nil subscription")
   sub.impl.unsubscribe()
   NATS_OK
 
-proc natsSubscription_Destroy*(sub: ptr natsSubscription): natsStatus =
+proc natsSubscription_Destroy*(sub: ptr natsSubscription) =
   ## Detach (unsubscribe); the handle itself is reclaimed by the collector once
   ## the caller drops it.
+  ##
+  ## **Deviates from nats.c, matches natswrapper**: nats.c returns a status
+  ## here, natswrapper's Futhark binding does not — and Niffler relies on that
+  ## (`defer: natsSubscription_Destroy(sub)`). Detaching cannot fail in this
+  ## implementation, so void is also the honest signature.
   if sub == nil or sub.impl == nil:
-    return setErr("natsSubscription_Destroy: nil subscription")
+    lastErrorText = "natsSubscription_Destroy: nil subscription"
+    return
   sub.impl.unsubscribe()
   sub.impl = nil
-  NATS_OK
 
 proc natsMsg_GetData*(msg: ptr natsMsg): cstring =
   if msg == nil: "" else: msg.data.cstring

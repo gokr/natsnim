@@ -15,7 +15,7 @@
 ## never interpreted.
 
 import std/[random, strutils, unittest]
-import nats/parser
+import natsnim/parser
 
 type
   OpKind = enum okMsg, okOK, okErr, okPing, okPong, okInfo

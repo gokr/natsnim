@@ -3,7 +3,7 @@
 ## cases below are derived from the implementation's stated semantics.
 
 import std/unittest
-import nats/subject
+import natsnim/subject
 
 suite "subject validation":
 
