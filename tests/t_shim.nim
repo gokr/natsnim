@@ -157,15 +157,34 @@ proc runTests(url: string) =
       check bytesOf(msg) == "echo:req\x00with\x00nul"
       natsMsg_Destroy(msg)
 
-    test "natsConnection_Request with no responder times out":
+    test "natsConnection_Request reports NATS_NO_RESPONDERS when nobody listens":
       var nc = connect(url)
       defer: nc.close()
       var msg: ptr natsMsg
       let body = "x"
-      check natsConnection_Request(addr msg, nc.conn, "shim.nobody",
+      let t0 = epochTime()
+      let st = natsConnection_Request(addr msg, nc.conn, "shim.nobody.listening",
+                                      body.cstring, body.len.cint, 5000)
+      check st == NATS_NO_RESPONDERS
+      check epochTime() - t0 < 1.0
+      check getErrorString(NATS_NO_RESPONDERS).contains("no responders")
+
+    test "natsConnection_Request times out when the responder stays silent":
+      # A missing subject takes the fail-fast path (503); a *present* but
+      # silent responder is the genuine timeout case.
+      var nc = connect(url)
+      defer: nc.close()
+      var silent: ptr natsSubscription
+      check natsConnection_SubscribeSync(addr silent, nc.conn,
+                                         "shim.silent") == NATS_OK
+      check natsConnection_FlushTimeout(nc.conn, 2000) == NATS_OK
+      var msg: ptr natsMsg
+      let body = "x"
+      check natsConnection_Request(addr msg, nc.conn, "shim.silent",
                                    body.cstring, body.len.cint,
                                    250) == NATS_TIMEOUT
       check getErrorString(NATS_TIMEOUT) == "timeout"
+      natsSubscription_Destroy(silent)
 
     test "failures report NATS_ERR with a message":
       var nc = connect(url)

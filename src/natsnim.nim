@@ -20,6 +20,7 @@
 import std/[json, strutils]
 import natsnim/parser
 import natsnim/conn as core
+export NoRespondersError
 
 export core
 
@@ -45,6 +46,8 @@ type
 const
   NATS_OK* = 0.natsStatus
   NATS_ERR* = 1.natsStatus
+  NATS_NO_RESPONDERS* = 23.natsStatus
+    ## The server answered a request with 503: no subscriber on the subject.
   NATS_TIMEOUT* = 21.natsStatus
     ## Sentinel for "no message within the timeout". The numeric value is ours
     ## (only `checkStatus` and `== NATS_TIMEOUT` are contractual); nats.c's
@@ -58,6 +61,7 @@ proc getErrorString*(status: natsStatus): string =
   case status
   of NATS_OK: "ok"
   of NATS_TIMEOUT: "timeout"
+  of NATS_NO_RESPONDERS: "no responders available for request"
   of NATS_ERR: lastErrorText
   else: "nats status " & $status
 
@@ -240,6 +244,11 @@ proc natsConnection_Request*(msg: ptr ptr natsMsg, conn: ptr natsConnection,
     let reply = c.request($subject, cstrToStr(data, dataLen), timeoutMs.int)
     msg[] = msgHandle(reply)
     NATS_OK
+  except NoRespondersError as e:
+    # nats.c reports this as NATS_NO_RESPONDERS and returns immediately, which
+    # callers rely on to distinguish "no such component" from a timeout.
+    lastErrorText = e.msg
+    NATS_NO_RESPONDERS
   except NatsTimeout as e:
     lastErrorText = e.msg
     NATS_TIMEOUT

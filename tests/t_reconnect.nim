@@ -83,10 +83,12 @@ proc runTests(url: string) =
       check sub.nextMsg(2000).data == "after"
       check sub.sid == sidBefore
 
-      # A reply subject handed out before the outage still routes: an inbox
-      # subscription is an ordinary subscription and was resubscribed too.
-      expect core.NatsTimeout:
-        discard c.request("r.nobody", "x", 300)
+      # A reply subject handed out before the outage still routes: the inbox
+      # subscription was resubscribed too. Stronger than a timeout — the 503
+      # for a subject nobody serves can only arrive if our re-SUB'd inbox is
+      # live on the server.
+      expect core.NoRespondersError:
+        discard c.request("r.nobody", "x", 2000)
 
     test "publishes during the outage are buffered and delivered in order":
       var srv = startServer(maxPayload = 1024)

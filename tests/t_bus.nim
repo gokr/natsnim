@@ -127,13 +127,40 @@ proc runTests(url: string, port: int) =
       check m.subject.len > 0
       check m.data == "re:ping"
 
-    test "request() times out and leaves no inbox subscription behind":
+    test "a request with no responders fails fast instead of timing out":
+      # The server answers a request whose subject has no subscribers with a
+      # 503 status message, but only if the client advertised
+      # `no_responders: true`. Without that (and without parsing the status)
+      # every probe of an absent component costs the full request timeout —
+      # which in Niffler pushed real work past a runner's idle window.
       let c = core.dial(url)
       defer: c.close()
+      let t0 = epochTime()
+      var raised = false
+      try:
+        discard c.request("nobody.listening", "x", 5000)
+      except core.NoRespondersError:
+        raised = true
+      check raised
+      check epochTime() - t0 < 1.0        # not the 5 s timeout
+      # the connection is still usable afterwards
+      let sub = c.subscribe("t.after")
+      c.flush()
+      c.publish("t.after", "still-here")
+      check sub.nextMsg(2000).data == "still-here"
+
+    test "request() times out and leaves no inbox subscription behind":
+      # Needs a subject that *has* a subscriber which never answers: with no
+      # subscriber at all the fail-fast path (503) applies, not a timeout.
+      let c = core.dial(url)
+      defer: c.close()
+      let silent = c.subscribe("t.silent")     # never replies
+      c.flush()
       let before = c.subscriptionCount
       expect core.NatsTimeout:
-        discard c.request("svc.nobody", "x", 250)
-      check c.subscriptionCount == before
+        discard c.request("t.silent", "x", 250)
+      check c.subscriptionCount == before      # the inbox was removed
+      silent.unsubscribe()
 
     test "queue group delivers each message exactly once":
       let pub = core.dial(url)

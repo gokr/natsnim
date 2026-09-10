@@ -50,6 +50,9 @@ In (core NATS):
   routes by `sid`, as the protocol intends)
 - headers: HMSG is split into `headers` + `data`
 - request/reply with inboxes and timeouts, `flush`, `max_payload` enforcement
+- **no-responders**: CONNECT advertises it and a 503 status from the server
+  becomes `NoRespondersError` (`NATS_NO_RESPONDERS` in the shim), so a request
+  to an absent component fails immediately instead of burning its timeout
 - optional user/password from the URL
 - **reconnect + resubscribe** across a server restart, with publishes buffered
   (bounded) while disconnected — see below

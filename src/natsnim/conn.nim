@@ -47,6 +47,10 @@ type UrlParts* = object
 type
   NatsError* = object of CatchableError
   NatsTimeout* = object of NatsError
+  NoRespondersError* = object of NatsError
+    ## The server answered a request with status 503: nobody is subscribed to
+    ## that subject. Distinct from a timeout so callers can tell "no such
+    ## component" from "the component is slow or gone".
 
   ServerInfo* = object
     serverId*: string
@@ -65,6 +69,7 @@ type
     headers*: string   ## raw header block ("" when the message carries none)
     sid*: int64
     size*: int         ## full payload size as framed
+    status*: int       ## NATS status code from the header block (0 = none)
 
   Subscription* = ref object
     conn*: Connection
@@ -76,6 +81,8 @@ type
     dropped*: int64    ## messages discarded because the limit was hit
     overrun*: bool     ## set once `dropped > 0`
     closed*: bool
+    status*: int       ## pending error status (>= 300), raised by nextMsg
+    statusText*: string
 
   Connection* = ref object
     sock: Socket
@@ -163,6 +170,27 @@ proc subscriptionCount*(conn: Connection): int =
 
 # --- parser sink ------------------------------------------------------------
 
+proc headerStatus(headers: string): tuple[code: int, text: string] =
+  ## Parse the status out of a header block: `NATS/1.0 [<code> [<text>]]`.
+  ## `NATS/1.0\r\n\r\n` is a normal header message (code 0).
+  let eol = headers.find("\r\n")
+  if eol <= 0: return (0, "")
+  let line = headers[0 ..< eol]
+  if not line.startsWith("NATS/1.0"): return (0, "")
+  var rest = line["NATS/1.0".len .. ^1].strip()
+  if rest.len == 0: return (0, "")
+  let sp = rest.find(' ')
+  var codeStr = rest
+  if sp >= 0:
+    codeStr = rest[0 ..< sp]
+    rest = rest[sp + 1 .. ^1].strip()
+  else:
+    rest = ""
+  try:
+    (parseInt(codeStr), rest)
+  except ValueError:
+    (0, "")
+
 proc deliver*(conn: Connection, a: MsgArgs, payload: string) =
   ## Route one parsed message to its subscription. Public because the parser's
   ## sink needs it (and because it is the seam the pending-limit test drives
@@ -175,6 +203,16 @@ proc deliver*(conn: Connection, a: MsgArgs, payload: string) =
   if a.hdr >= 0:
     m.headers = payload[0 ..< a.hdr]
     m.data = payload[a.hdr .. ^1]
+    let (code, text) = headerStatus(m.headers)
+    m.status = code
+    if code >= 300:
+      # A status is not data: the server answered our request with a failure
+      # (503 = no responders). Record it on the subscription so the waiting
+      # call fails *now* instead of sitting out its timeout — which is what
+      # `no_responders: true` in CONNECT exists for.
+      sub.status = code
+      sub.statusText = text
+      return
   else:
     m.data = payload
   if sub.pendingLimit > 0 and sub.msgs.len >= sub.pendingLimit:
@@ -380,7 +418,7 @@ proc handshake(conn: Connection) =
     "protocol": 1,
     "echo": true,
     "headers": true,
-    "no_responders": false
+    "no_responders": true
   }
   if conn.opts.clientName.len > 0: c["name"] = %conn.opts.clientName
   if conn.parts.user.len > 0:
@@ -658,6 +696,17 @@ proc nextMsg*(sub: Subscription, timeoutMs: int): Message =
   if timed: deadline = getMonoTime() + initDuration(milliseconds = timeoutMs)
   while true:
     if sub.msgs.len > 0: return sub.msgs.popFirst()
+    if sub.status != 0:
+      let code = sub.status
+      let text = sub.statusText
+      sub.status = 0
+      sub.statusText = ""
+      if code == 503:
+        raise newException(NoRespondersError,
+          "no responders available for '" & sub.subject & "'")
+      fail("server status " & $code &
+           (if text.len > 0: " (" & text & ")" else: "") &
+           " on '" & sub.subject & "'")
     if sub.closed: fail("subscription on '" & sub.subject & "' is closed")
     let conn = sub.conn
     if conn == nil: fail("subscription has no connection")
