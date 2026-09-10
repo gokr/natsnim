@@ -1,0 +1,6 @@
+nimcache/
+tests/t_parser
+tests/t_bus
+tests/t_request
+tests/t_queuegroup
+*.exe

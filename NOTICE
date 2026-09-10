@@ -1,0 +1,10 @@
+nats-nim
+Copyright 2026 Göran Krampe
+
+This product includes software developed at nats.io
+(https://nats.io) and is a derivative work of nats-io/nats.go
+(https://github.com/nats-io/nats.go), licensed under the Apache License 2.0.
+
+  Copyright 2012-2026 The NATS Authors
+
+Ported files are mapped to their upstream origin in PROVENANCE.md.
