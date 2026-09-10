@@ -88,6 +88,47 @@ Being precise, because this determines the effort:
   ("the child holds no credentials"), so none of these are on the critical
   path.
 
+## Transport and threading contract
+
+Decision: the client is **synchronous**. No `asyncdispatch` — and **no threads
+and no callbacks**.
+
+- One TCP socket, one parser and per-subscription queues, all owned by the
+  connection. The socket is only ever read *inside a public call* —
+  `NextMsg`, `Request`, `Flush` — with a `select()` timeout. Nothing runs in
+  the background; there is no reader thread, no channel, no timer service.
+- `NextMsg(sub, timeout)` mirrors `nats.go` exactly: first a non-blocking pop
+  from `sub`'s queue (Go does `select`/`default` before arming its timer),
+  then wait up to `timeout` ms for bytes, demultiplexing every incoming
+  `MSG` frame into *each* subscription's queue. `timeout == 0` means "do not
+  wait" (Go and `nats.c` agree; Niffler relies on it).
+- Niffler's call sites confirm the shape: the SDK pump polls
+  `NextMsg(..., 1)`, `requestEnvelope` uses `NextMsg(..., 0)` after a flush,
+  the dispatch and approval loops use 100 ms, and **no call site passes a
+  callback**. No Nim source in the repo uses `std/threads`, `createThread`
+  or `taskpools` today.
+- Threads would only buy a *push*/callback API — which is precisely what
+  `nats.c`'s internal reader thread exists for, and the design Niffler
+  deliberately avoids (serialized pump, normal GC, no cross-thread sharing).
+  A threaded client would introduce the first thread in the Nim half of the
+  harness for no gain.
+
+Consequences, documented rather than discovered later:
+
+- **A connection is not safe for concurrent use from several threads.** A
+  component that wants to call the bus from a worker thread owns its own
+  connection. (If that ever changes, an internal lock or reader thread is a
+  deliberate, component-local decision — AGENTS.md's rule for concurrency —
+  not a default of this library.)
+- **Invariant to test above all others:** a 1 ms poll on one subscription
+  must never drop a message addressed to another. Queues are unbounded in Go
+  (`DefaultSubPendingMsgsLimit = 500_000`); we will ship an explicit,
+  configurable limit with a fail-loud policy instead of growing silently.
+- Reconnect is therefore *lazy*: it happens on the next call that finds the
+  socket dead, not on a background tick. No message loss is implied —
+  `Flush`/`Request` surface it, and resubscription runs before the call
+  returns.
+
 ## Deliverable: the shim contract
 
 The library must be a drop-in for `natswrapper`, because that is what makes

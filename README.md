@@ -29,6 +29,18 @@ Out (v1): TLS, nkeys/JWT credentials, JetStream, KV/object store, micro,
 WebSocket, compression. This is a *core NATS, plaintext* client — plenty for
 a loopback bus, not a drop-in for a public NATS deployment.
 
+## Threading
+
+**Synchronous: no `asyncdispatch`, no threads, no callbacks.** The socket is
+read only inside `NextMsg`/`Request`/`Flush` via `select()` with the caller's
+timeout; the parser demultiplexes into per-subscription queues. `timeout == 0`
+is a non-blocking poll, as in `nats.go` and `nats.c`.
+
+Threads would only buy a push/callback API — the thing Niffler's serialized
+pump exists to avoid. The trade-off is explicit: **a connection is not safe
+for concurrent use from several threads**; a worker thread should own its own
+connection. See [ASSESSMENT.md](ASSESSMENT.md#transport-and-threading-contract).
+
 ## Compatibility goal
 
 A drop-in for the `natswrapper` surface used by Niffler, so adoption is a
