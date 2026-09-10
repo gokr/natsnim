@@ -10,8 +10,14 @@ It is a **translation of the official Go client**
 than of `nats.c` — see [ASSESSMENT.md](ASSESSMENT.md) for the measurements
 and the reasoning.
 
-Status: **nothing ported yet** (skeleton + provenance only). See the phase
-plan in [ASSESSMENT.md](ASSESSMENT.md#plan).
+Status: **P1 (parser) landed.** `parser.nim`, `nuid.nim` and `subject.nim`
+are ported and green under `nimble test` (23 cases, including the split-buffer
+and HMSG coverage); the transport (P2) is next. See the phase plan in
+[ASSESSMENT.md](ASSESSMENT.md#plan).
+
+```bash
+nimble test        # parser + nuid + subject suites
+```
 
 ## Scope
 
