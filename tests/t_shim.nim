@@ -55,6 +55,21 @@ proc runTests(url: string) =
       check natsConnection_GetMaxPayload(nc.conn) == 1024
       check natsSubscription_Destroy(sub) == NATS_OK
 
+    test "natsConnection_Flush does a PING/PONG round trip":
+      var nc = connect(url)
+      defer: nc.close()
+      check natsConnection_Flush(nc.conn) == NATS_OK
+      # ...and works as a barrier: what was published before it is deliverable
+      var sub: ptr natsSubscription
+      check natsConnection_SubscribeSync(addr sub, nc.conn, "shim.flush") == NATS_OK
+      check natsConnection_Flush(nc.conn) == NATS_OK
+      check natsConnection_PublishString(nc.conn, "shim.flush", "x") == NATS_OK
+      check natsConnection_Flush(nc.conn) == NATS_OK
+      var msg: ptr natsMsg
+      check natsSubscription_NextMsg(addr msg, sub, 0) == NATS_OK
+      check $natsMsg_GetData(msg) == "x"
+      discard natsSubscription_Destroy(sub)
+
     test "QueueSubscribeSync shares one message across the group":
       var nc = connect(url)
       defer: nc.close()

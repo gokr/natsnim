@@ -156,6 +156,22 @@ proc natsConnection_FlushTimeout*(conn: ptr natsConnection,
   except CatchableError as e:
     setErr(e.msg)
 
+proc natsConnection_Flush*(conn: ptr natsConnection): natsStatus =
+  ## PING/PONG round trip with a bounded wait. Deviation from nats.c, whose
+  ## `natsConnection_Flush` blocks until the connection's own default timeout:
+  ## this client never waits unbounded (there is no thread to interrupt it), so
+  ## it uses `defaultFlushTimeoutMs`.
+  let c = rawConn(conn)
+  if c == nil: return setErr("natsConnection_Flush: nil connection")
+  try:
+    c.flush(core.defaultFlushTimeoutMs)
+    NATS_OK
+  except NatsTimeout as e:
+    lastErrorText = e.msg
+    NATS_TIMEOUT
+  except CatchableError as e:
+    setErr(e.msg)
+
 proc natsConnection_GetMaxPayload*(conn: ptr natsConnection): cint =
   let c = rawConn(conn)
   if c == nil: 0.cint else: cint(c.maxPayload)
