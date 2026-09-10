@@ -37,6 +37,12 @@ const
     ## surfaced (fail-loud) by the next `nextMsg`.
   readChunk = 65536
 
+type UrlParts* = object
+  host*: string
+  port*: int
+  user*: string
+  pass*: string
+
 type
   NatsError* = object of CatchableError
   NatsTimeout* = object of NatsError
@@ -79,7 +85,17 @@ type
     info*: ServerInfo
     maxPayload*: int
     sidSeq: int64
-    closed*: bool
+    closed*: bool        ## explicitly closed: no reconnecting, all calls fail
+    connected*: bool     ## socket is live (false = in a reconnect window)
+    handshaking: bool    ## inside a dial/attempt: no nested attempts
+    opts: DialOptions
+    parts: UrlParts
+    haveAttempt: bool
+    lastAttempt: MonoTime
+    reconnectAttempts*: int
+    reconnectCount*: int
+    lastDisconnect*: string
+    pending: string      ## publishes buffered while disconnected
     serverErrors*: seq[string]
     pingsOut: int64
     pongsIn: int64
@@ -88,13 +104,40 @@ type
     connectTimeoutMs*: int
     handshakeTimeoutMs*: int
     clientName*: string
+    reconnectWaitMs*: int
+      ## Minimum spacing between reconnect attempts (default 2000).
+    maxReconnects*: int
+      ## Attempts before giving up (default 60; 0 disables reconnecting;
+      ## -1 means unlimited).
+    reconnectBufSize*: int
+      ## Outgoing publishes buffered while disconnected (default 8 MiB).
+      ## Past it a publish fails instead of being dropped, as Go does.
+    reconnect*: bool
+      ## Master switch (default true). With it off a lost connection is fatal
+      ## to the calls in flight, which is what Niffler did before P5.
 
 proc defaultDialOptions*(): DialOptions =
   DialOptions(connectTimeoutMs: defaultConnectTimeoutMs,
-              handshakeTimeoutMs: defaultHandshakeTimeoutMs)
+              handshakeTimeoutMs: defaultHandshakeTimeoutMs,
+              reconnectWaitMs: 2000, maxReconnects: 60,
+              reconnectBufSize: 8 * 1024 * 1024, reconnect: true)
 
 proc fail(msg: string) {.noreturn.} =
   raise newException(NatsError, msg)
+
+proc noteDisconnect(conn: Connection, reason: string) =
+  ## The connection died. Not an error by itself: it opens a reconnect window
+  ## that the *waiting* calls (nextMsg/flush/request) close, since there is no
+  ## background thread to do it.
+  if not conn.connected: return
+  conn.connected = false
+  conn.lastDisconnect = reason
+  conn.reconnectAttempts = 0
+  if conn.sock != nil:
+    try: conn.sock.close()
+    except CatchableError: discard
+    conn.sock = nil
+
 
 proc pendingCount*(sub: Subscription): int =
   ## Messages queued locally for `sub` and not yet read.
@@ -138,6 +181,7 @@ proc waitReadable(conn: Connection, timeoutMs: int): bool =
   let t = if timeoutMs < 0: -1.cint else: cint(timeoutMs)
   let r = poll(addr fds[0], 1.Tnfds, t)
   if r < 0:
+    conn.noteDisconnect("poll: " & $osLastError())
     fail("poll: " & $osLastError())
   if r == 0:
     return false
@@ -145,12 +189,23 @@ proc waitReadable(conn: Connection, timeoutMs: int): bool =
     return true   # let recv report the detail
   (fds[0].revents and POLLIN) != 0
 
-proc writeAll(conn: Connection, data: string) =
+proc writeDirect(conn: Connection, data: string) =
+  ## Raw write on the live socket. Only used when connected (handshake,
+  ## resubscribe, pending flush, PING/PONG).
   if conn.sock == nil: fail("connection has no socket")
-  try:
-    conn.sock.send(data)
-  except CatchableError as e:
-    fail("send: " & e.msg)
+  if conn.connected:
+    try:
+      conn.sock.send(data)
+    except CatchableError as e:
+      conn.noteDisconnect("send: " & e.msg)
+      fail("send: " & e.msg)
+  else:
+    # the handshake writes before `connected` is set: allow it, but any
+    # failure still has to surface
+    try:
+      conn.sock.send(data)
+    except CatchableError as e:
+      fail("send: " & e.msg)
 
 proc feed(conn: Connection, data: string) =
   let e = conn.parser.parse(data, conn.sink)
@@ -162,16 +217,27 @@ proc readSome(conn: Connection): int =
   try:
     buf = conn.sock.recv(readChunk)
   except CatchableError as e:
+    conn.noteDisconnect("recv: " & e.msg)
     fail("recv: " & e.msg)
   if buf.len == 0:
-    conn.closed = true
+    conn.noteDisconnect("connection closed by server")
     fail("connection closed by server")
   conn.feed(buf)
   buf.len
 
 proc pump*(conn: Connection, timeoutMs: int): bool =
   ## Wait up to `timeoutMs` ms for bytes and parse them; false when none came.
+  ## While disconnected there is nothing to poll, so the timeout is spent
+  ## sleeping: a caller pacing on `nextMsg(1)` must not spin hot (and must not
+  ## be blocked by a reconnect attempt either — see `ensureConnected`).
   if conn.closed: fail("connection is closed")
+  if conn.sock == nil:
+    # No socket to poll: spend the timeout so a polling caller (nextMsg(1))
+    # keeps its cadence instead of spinning. Note the test is the socket, not
+    # `connected` — during a dial/reconnect handshake the socket is live while
+    # `connected` is still false.
+    if timeoutMs > 0: sleep(timeoutMs)
+    return false
   if not conn.waitReadable(timeoutMs): return false
   discard conn.readSome()
   true
@@ -203,7 +269,7 @@ proc makeSink(conn: Connection): Sink =
       conn.serverErrors.add("bad INFO: " & e.msg)
   proc onPing() =
     try:
-      conn.writeAll("PONG\r\n")
+      conn.writeDirect("PONG\r\n")
     except CatchableError:
       discard
   Sink(onMsg: onMsg, onErr: onErr, onPong: onPong, onInfo: onInfo,
@@ -214,12 +280,6 @@ proc setSink(conn: Connection) =
   conn.sink = makeSink(conn)
 
 # --- URL parsing ------------------------------------------------------------
-
-type UrlParts* = object
-  host*: string
-  port*: int
-  user*: string
-  pass*: string
 
 proc parseUrl*(url: string): UrlParts =
   ## Accepts `nats://host:port`, `nats://user:pass@host:port`, `host:port` and
@@ -281,28 +341,21 @@ proc connectSocket(parts: UrlParts, timeoutMs: int): Socket =
     result.close()
     fail("cannot connect to " & parts.host & ":" & $parts.port & ": " & e.msg)
 
-proc dial*(url: string, opts = defaultDialOptions()): Connection =
-  ## Connect, complete the INFO/CONNECT handshake and validate it with a
-  ## PING/PONG round trip (which is also when an auth failure surfaces).
-  let parts = parseUrl(url)
-  result = Connection(
-    sock: connectSocket(parts, opts.connectTimeoutMs),
-    parser: initParser(),
-    subs: initTable[int64, Subscription](),
-    pongsIn: 0,
-    pingsOut: 0,
-    serverErrors: @[])
-  result.setSink()
+proc handshake(conn: Connection) =
+  ## INFO → CONNECT → PING/PONG. The server speaks first, and a `-ERR` (an auth
+  ## failure, say) surfaces here rather than as a timeout. Used for the initial
+  ## dial and for every reconnect attempt, so both paths behave identically.
+  let deadline = getMonoTime() +
+                 initDuration(milliseconds = conn.opts.handshakeTimeoutMs)
 
-  # 1. The server speaks first: INFO.
-  let deadline = getMonoTime() + initDuration(milliseconds = opts.handshakeTimeoutMs)
-  while result.info.raw == nil:
-    if result.serverErrors.len > 0:
-      fail("server refused the connection: " & result.serverErrors[^1])
+  # 1. INFO (the server's greeting; also re-sent on a reconnect).
+  while conn.info.raw == nil:
+    if conn.serverErrors.len > 0:
+      fail("server refused the connection: " & conn.serverErrors[^1])
     let rem = (deadline - getMonoTime()).inMilliseconds
     if rem <= 0:
       fail("handshake timed out waiting for INFO")
-    if not result.pump(rem.int):
+    if not conn.pump(rem.int):
       continue
 
   # 2. CONNECT.
@@ -316,27 +369,159 @@ proc dial*(url: string, opts = defaultDialOptions()): Connection =
     "headers": true,
     "no_responders": false
   }
-  if opts.clientName.len > 0: c["name"] = %opts.clientName
-  if parts.user.len > 0:
-    c["user"] = %parts.user
-    c["pass"] = %parts.pass
-  result.writeAll("CONNECT " & $c & "\r\n")
+  if conn.opts.clientName.len > 0: c["name"] = %conn.opts.clientName
+  if conn.parts.user.len > 0:
+    c["user"] = %conn.parts.user
+    c["pass"] = %conn.parts.pass
+  conn.writeDirect("CONNECT " & $c & "\r\n")
 
-  # 3. PING/PONG validation.
-  result.writeAll("PING\r\n")
-  inc result.pingsOut
-  while result.pongsIn < result.pingsOut:
-    if result.serverErrors.len > 0:
-      fail("server refused the connection: " & result.serverErrors[^1])
+  # 3. PING/PONG validation (this is also when an auth failure lands).
+  conn.writeDirect("PING\r\n")
+  inc conn.pingsOut
+  while conn.pongsIn < conn.pingsOut:
+    if conn.serverErrors.len > 0:
+      fail("server refused the connection: " & conn.serverErrors[^1])
     let rem = (deadline - getMonoTime()).inMilliseconds
     if rem <= 0:
       fail("handshake timed out waiting for PONG")
-    if not result.pump(rem.int):
+    if not conn.pump(rem.int):
       continue
 
+proc resubscribe(conn: Connection) =
+  ## Re-register every live subscription **with its existing sid**. Keeping the
+  ## sid is what makes reconnect transparent: a reply subject handed out before
+  ## the outage still routes afterwards, and a subscription's local queue
+  ## (messages already delivered) is untouched. This is what Go's
+  ## `resubscribe` does, minus the batching its reader goroutine needs.
+  for sid, sub in conn.subs:
+    if sub.closed: continue
+    var cmd = "SUB " & sub.subject
+    if sub.queue.len > 0: cmd.add(" " & sub.queue)
+    cmd.add(" " & $sid & "\r\n")
+    conn.writeDirect(cmd)
+
+proc flushPending(conn: Connection) =
+  ## Publishes buffered during the outage, written after the resubscribes so a
+  ## message published to one of our own subjects is still delivered to us.
+  if conn.pending.len == 0: return
+  conn.writeDirect(conn.pending)
+  conn.pending.setLen(0)
+
+proc tryReconnect(conn: Connection): bool =
+  ## One attempt: dial, handshake, resubscribe, flush buffered publishes.
+  ## Never called from a thread — the waiting calls drive it.
+  if conn.closed or conn.handshaking or not conn.opts.reconnect: return false
+  if conn.opts.maxReconnects == 0: return false
+  if conn.opts.maxReconnects > 0 and
+     conn.reconnectAttempts >= conn.opts.maxReconnects:
+    return false
+  conn.haveAttempt = true
+  conn.lastAttempt = getMonoTime()
+  inc conn.reconnectAttempts
+  conn.handshaking = true
+  defer: conn.handshaking = false
+  try:
+    conn.sock = connectSocket(conn.parts, conn.opts.connectTimeoutMs)
+    # A fresh parser: a partial frame from the dead socket is meaningless, and
+    # a new INFO is on its way.
+    conn.parser = initParser()
+    conn.info.raw = nil
+    conn.serverErrors.setLen(0)
+    conn.pongsIn = 0
+    conn.pingsOut = 0
+    conn.handshake()
+    conn.resubscribe()
+    conn.flushPending()
+    conn.connected = true
+    conn.reconnectAttempts = 0
+    inc conn.reconnectCount
+    true
+  except CatchableError as e:
+    conn.lastDisconnect = e.msg
+    if conn.sock != nil:
+      try: conn.sock.close()
+      except CatchableError: discard
+      conn.sock = nil
+    false
+
+proc ensureConnected(conn: Connection): bool =
+  ## True when the socket is live. Otherwise maybe attempt a reconnect — but at
+  ## most once per `reconnectWaitMs`, so a 1 ms `nextMsg` poll neither spins nor
+  ## blocks more than one attempt per window.
+  if conn.connected: return true
+  if conn.closed or conn.handshaking: return false
+  if not conn.opts.reconnect or conn.opts.maxReconnects == 0: return false
+  if conn.opts.maxReconnects > 0 and
+     conn.reconnectAttempts >= conn.opts.maxReconnects:
+    return false
+  if conn.haveAttempt:
+    let elapsed = (getMonoTime() - conn.lastAttempt).inMilliseconds
+    if elapsed < conn.opts.reconnectWaitMs.int64:
+      return false
+  conn.tryReconnect()
+
+proc connectionAlive*(conn: Connection): bool =
+  ## Live socket, or successfully re-established after an outage.
+  conn.connected or conn.ensureConnected()
+
+proc outageReason(conn: Connection): string =
+  ## Human-readable state of a dead connection, for error messages.
+  var why = "connection lost"
+  if conn.lastDisconnect.len > 0: why.add(" (" & conn.lastDisconnect & ")")
+  if conn.opts.maxReconnects > 0 and
+     conn.reconnectAttempts >= conn.opts.maxReconnects:
+    why.add("; giving up after " & $conn.reconnectAttempts &
+            " reconnect attempts")
+  elif conn.reconnectAttempts > 0:
+    why.add("; " & $conn.reconnectAttempts & " reconnect attempt(s) so far")
+  elif not conn.opts.reconnect:
+    why.add("; reconnecting is disabled")
+  why
+
+proc awaitConnected*(conn: Connection, timeoutMs: int, what: string): bool =
+  ## Wait up to `timeoutMs` for a live connection, attempting reconnects as the
+  ## window allows. False when the budget ran out; raises when waiting is
+  ## pointless (explicitly closed, reconnecting disabled, attempts exhausted).
+  ##
+  ## This is what makes `flush(8000)` *wait out* an outage instead of failing
+  ## because the next attempt is not due for another few hundred ms.
+  let deadline = getMonoTime() + initDuration(milliseconds = timeoutMs)
+  while true:
+    if conn.connected: return true
+    if conn.closed: fail(what & ": connection is closed")
+    if not conn.opts.reconnect or conn.opts.maxReconnects == 0:
+      fail(what & ": " & conn.outageReason())
+    if conn.opts.maxReconnects > 0 and
+       conn.reconnectAttempts >= conn.opts.maxReconnects:
+      fail(what & ": " & conn.outageReason())
+    if conn.ensureConnected(): return true
+    let rem = (deadline - getMonoTime()).inMilliseconds
+    if rem <= 0: return false
+    # not yet due (the window spaces attempts): wait a slice and re-check
+    sleep(min(rem, 25).int)
+
+proc dial*(url: string, opts = defaultDialOptions()): Connection =
+  ## Connect, complete the INFO/CONNECT handshake and validate it with a
+  ## PING/PONG round trip (which is also when an auth failure surfaces).
+  result = Connection(
+    parser: initParser(),
+    subs: initTable[int64, Subscription](),
+    opts: opts,
+    parts: parseUrl(url),
+    pongsIn: 0,
+    pingsOut: 0,
+    serverErrors: @[])
+  result.setSink()
+  result.sock = connectSocket(result.parts, opts.connectTimeoutMs)
+  result.handshake()
+  result.connected = true
+
 proc close*(conn: Connection) =
+  ## Explicit close: no reconnecting afterwards, buffered publishes dropped.
   if conn.closed and conn.sock == nil: return
   conn.closed = true
+  conn.connected = false
+  conn.pending.setLen(0)
   for sub in conn.subs.values: sub.closed = true
   conn.subs.clear()
   if conn.sock != nil:
@@ -357,10 +542,15 @@ proc subscribe*(conn: Connection, subject: string, queue = "",
                         sid: conn.sidSeq, msgs: initDeque[Message](),
                         pendingLimit: pendingLimit)
   conn.subs[result.sid] = result   # registered before the wire so no reply is lost
-  var cmd = "SUB " & subject
-  if queue.len > 0: cmd.add(" " & queue)
-  cmd.add(" " & $result.sid & "\r\n")
-  conn.writeAll(cmd)
+  # While disconnected only the local record is kept: `resubscribe` sends every
+  # live subscription (with its sid) after the reconnect, so a subscribe during
+  # an outage takes effect then. No frame is buffered, which also means a
+  # reconnect cannot double-register a sid.
+  if conn.connected:
+    var cmd = "SUB " & subject
+    if queue.len > 0: cmd.add(" " & queue)
+    cmd.add(" " & $result.sid & "\r\n")
+    conn.writeDirect(cmd)
 
 proc unsubscribe*(sub: Subscription, maxMsgs = 0) =
   ## Send UNSUB, drop the local queue and detach from the connection.
@@ -369,11 +559,15 @@ proc unsubscribe*(sub: Subscription, maxMsgs = 0) =
   sub.msgs.clear()
   if sub.conn != nil:
     sub.conn.subs.del(sub.sid)
-    if not sub.conn.closed:
+    # Same reasoning as subscribe: removing it locally is enough — a
+    # reconnect resubscribes exactly what is still registered. With a live
+    # socket the UNSUB goes out now, best effort (a dying connection is not
+    # worth failing an unsubscribe over).
+    if sub.conn.connected:
       var cmd = "UNSUB " & $sub.sid
       if maxMsgs > 0: cmd.add(" " & $maxMsgs)
       cmd.add("\r\n")
-      try: sub.conn.writeAll(cmd)
+      try: sub.conn.writeDirect(cmd)
       except CatchableError: discard
 
 proc publishRaw(conn: Connection, subject, reply, data: string) =
@@ -387,9 +581,24 @@ proc publishRaw(conn: Connection, subject, reply, data: string) =
   var h = "PUB " & subject
   if reply.len > 0: h.add(" " & reply)
   h.add(" " & $data.len & "\r\n")
-  conn.writeAll(h)
-  conn.writeAll(data)
-  conn.writeAll("\r\n")
+  let frame = h & data & "\r\n"
+  if conn.connected:
+    conn.writeDirect(frame)
+    return
+  # Disconnected: buffer, as Go does, and never drop silently. Past the cap the
+  # publish fails — the caller decides, we do not pretend it was sent.
+  if not conn.opts.reconnect:
+    fail("publish to '" & subject & "': connection lost (" &
+         conn.lastDisconnect & ") and reconnecting is disabled")
+  if conn.opts.reconnectBufSize <= 0:
+    fail("publish to '" & subject & "': connection lost (" &
+         conn.lastDisconnect & ") and buffering is disabled")
+  if conn.pending.len + frame.len > conn.opts.reconnectBufSize:
+    fail("publish to '" & subject & "': reconnect buffer exceeded (" &
+         $conn.pending.len & " + " & $frame.len & " > " &
+         $conn.opts.reconnectBufSize & " bytes); " &
+         "connection lost (" & conn.lastDisconnect & ")")
+  conn.pending.add(frame)
 
 proc publish*(conn: Connection, subject, data: string) =
   conn.publishRaw(subject, "", data)
@@ -416,14 +625,33 @@ proc nextMsg*(sub: Subscription, timeoutMs: int): Message =
     if sub.msgs.len > 0: return sub.msgs.popFirst()
     if sub.closed: fail("subscription on '" & sub.subject & "' is closed")
     let conn = sub.conn
-    if conn == nil or conn.closed: fail("connection is closed")
+    if conn == nil: fail("subscription has no connection")
+    if conn.closed: fail("connection is closed")
+    if not conn.connected:
+      if conn.ensureConnected():
+        continue
+      # Disconnected and no attempt was due (or it failed). Consume this
+      # call's budget first: the SDK pump polls with a 1 ms timeout and must
+      # not spin at 100% CPU while the bus is down. Then report it — a lost
+      # connection is an error, not a timeout.
+      if timed:
+        let rem = (deadline - getMonoTime()).inMilliseconds
+        if rem > 0: sleep(rem.int)
+      fail("no message on '" & sub.subject & "': " & conn.outageReason())
     var waitMs = 0
     if timed:
       let rem = (deadline - getMonoTime()).inMilliseconds
       if rem <= 0: break
       waitMs = rem.int
-    discard conn.pump(waitMs)
+    try:
+      discard conn.pump(waitMs)
+    except NatsError:
+      # The socket died while we were waiting. `noteDisconnect` has already
+      # run, so the next turn of the loop takes the reconnect path; rethrow
+      # only if the connection is somehow still considered alive.
+      if conn.connected: raise
     if sub.msgs.len > 0: return sub.msgs.popFirst()
+    if not conn.connected: continue
     if not timed: break
   raise newException(NatsTimeout,
     "no message on '" & sub.subject & "' within " & $timeoutMs & "ms")
@@ -442,11 +670,14 @@ proc take*(sub: Subscription): Message =
 
 proc flush*(conn: Connection, timeoutMs = defaultFlushTimeoutMs) =
   ## PING/PONG round trip. Messages arriving meanwhile are queued to their
-  ## subscriptions, never lost.
-  if conn.closed: fail("connection is closed")
-  conn.writeAll("PING\r\n")
-  inc conn.pingsOut
+  ## subscriptions, never lost. A waiting call, so it drives a reconnect.
   let deadline = getMonoTime() + initDuration(milliseconds = timeoutMs)
+  if not conn.connectionAlive():
+    let rem = (deadline - getMonoTime()).inMilliseconds
+    if rem <= 0 or not conn.awaitConnected(rem.int, "flush"):
+      fail("flush: " & conn.outageReason())
+  conn.writeDirect("PING\r\n")
+  inc conn.pingsOut
   while conn.pongsIn < conn.pingsOut:
     let rem = (deadline - getMonoTime()).inMilliseconds
     if rem <= 0:
@@ -463,6 +694,9 @@ proc request*(conn: Connection, subject, data: string,
               timeoutMs = defaultFlushTimeoutMs): Message =
   ## Request/reply: subscribe an inbox, publish with that reply subject, wait
   ## for one message. The inbox subscription is removed before returning.
+  if not conn.connectionAlive() and
+     not conn.awaitConnected(timeoutMs, "request"):
+    fail("request: " & conn.outageReason())
   let inbox = conn.newInbox()
   let sub = conn.subscribe(inbox)
   let deadline = getMonoTime() + initDuration(milliseconds = timeoutMs)

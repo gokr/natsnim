@@ -17,3 +17,4 @@ task test, "Run the test suite":
   exec "nim c -r --hints:off --path:src -o:tests/bin/t_subject tests/t_subject.nim"
   exec "nim c -r --hints:off --path:src -o:tests/bin/t_bus tests/t_bus.nim"
   exec "nim c -r --hints:off --path:src -o:tests/bin/t_shim tests/t_shim.nim"
+  exec "nim c -r --hints:off --path:src -o:tests/bin/t_reconnect tests/t_reconnect.nim"

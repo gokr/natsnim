@@ -1,13 +1,15 @@
-## Test harness: locate, start and stop a real `nats-server`.
+## Test harness: locate, start, stop and restart a real `nats-server`.
 ##
 ## The server is not vendored here (Niffler vendors its own build); the suite
 ## looks for `$NATS_SERVER_BIN`, then `nats-server` on PATH. When neither
 ## exists the bus suites print a loud SKIPPED banner and pass — the parser,
-## nuid, subject, shim and pending-limit tests need no server.
+## nuid, subject and fixture tests need no server.
 ##
 ## Configuration goes through a generated config file rather than CLI flags:
 ## `max_payload` is a config-file-only setting in upstream nats-server (the
-## Niffler fork patches the CLI), so `-c` is the portable choice.
+## Niffler fork patches the CLI), so `-c` is the portable choice. The file is
+## kept around so the server can be *restarted on the same port*, which is what
+## the reconnect tests need.
 
 import std/[net, os, osproc, strutils, times]
 
@@ -21,6 +23,7 @@ type
     port*: int
     dir*: string
     logPath*: string
+    cfgPath*: string
 
 proc serverBinary*(): string =
   ## "" when no server binary is available.
@@ -41,46 +44,6 @@ proc freePort*(): int =
   s.bindAddr(Port(0), "127.0.0.1")
   result = int(s.getLocalAddr()[1])
 
-proc startServer*(maxPayload = 1024, extraConfig = ""): TestServer =
-  ## Start a private server in its own temp dir. `maxPayload` is small by
-  ## default so the client-side guard is exercised without large payloads.
-  result.bin = serverBinary()
-  if result.bin.len == 0:
-    raise newException(IOError, "no nats-server binary available")
-  result.port = freePort()
-  result.url = "nats://127.0.0.1:" & $result.port
-  result.dir = getTempDir() / ("natsnim-test-" & $getCurrentProcessId())
-  createDir(result.dir)
-  result.logPath = result.dir / "server.log"
-  let cfgPath = result.dir / "server.conf"
-  var cfg = "host: 127.0.0.1\nport: " & $result.port & "\n"
-  if maxPayload > 0:
-    cfg.add("max_payload: " & $maxPayload & "\n")
-  if extraConfig.len > 0:
-    cfg.add(extraConfig)
-  writeFile(cfgPath, cfg)
-
-  stderr.writeLine("[harness] starting " & result.bin & " on port " & $result.port)
-  result.process = startProcess(result.bin, args = @["-c", cfgPath, "-l", result.logPath],
-                             options = {poUsePath, poDaemon})
-
-  # Readiness: the handshake is the probe, so a partially started server is
-  # never mistaken for a ready one.
-  let deadline = epochTime() + 10.0
-  var lastErr = ""
-  while epochTime() < deadline:
-    try:
-      let c = core.dial(result.url)
-      c.close()
-      stderr.writeLine("[harness] ready at " & result.url)
-      return
-    except CatchableError as e:
-      lastErr = e.msg
-      sleep(50)
-  let log = if fileExists(result.logPath): readFile(result.logPath) else: "(no log)"
-  raise newException(IOError, "nats-server did not become ready at " &
-    result.url & " (last: " & lastErr & ")\n--- server log ---\n" & log)
-
 proc stopProcess*(p: Process) =
   ## terminate, then kill if it does not go within 2s. std/osproc's
   ## waitForExit returns the exit code (and -1 on timeout), so poll `running`.
@@ -95,6 +58,57 @@ proc stopProcess*(p: Process) =
   except CatchableError:
     discard
   p.close()
+
+proc startServerProcess*(srv: var TestServer) =
+  ## Spawn the server from the existing config and wait until it answers a
+  ## full handshake (a partially started server is never mistaken for ready).
+  srv.process = startProcess(srv.bin, args = @["-c", srv.cfgPath,
+                                              "-l", srv.logPath],
+                             options = {poUsePath, poDaemon})
+  let deadline = epochTime() + 10.0
+  var lastErr = ""
+  while epochTime() < deadline:
+    try:
+      let c = core.dial(srv.url)
+      c.close()
+      return
+    except CatchableError as e:
+      lastErr = e.msg
+      sleep(50)
+  let log = if fileExists(srv.logPath): readFile(srv.logPath) else: "(no log)"
+  raise newException(IOError, "nats-server did not become ready at " &
+    srv.url & " (last: " & lastErr & ")\n--- server log ---\n" & log)
+
+proc stopServerProcess*(srv: var TestServer) =
+  ## Kill the server but keep the config and directory, so it can be started
+  ## again on the same port.
+  stopProcess(srv.process)
+  srv.process = nil
+
+proc restart*(srv: var TestServer) =
+  ## Stop and start again on the same port — the outage a client must survive.
+  stopServerProcess(srv)
+  startServerProcess(srv)
+
+proc startServer*(maxPayload = 1024, extraConfig = ""): TestServer =
+  ## Start a private server in its own temp dir. `maxPayload` is small by
+  ## default so the client-side guard is exercised without large payloads.
+  result.bin = serverBinary()
+  if result.bin.len == 0:
+    raise newException(IOError, "no nats-server binary available")
+  result.port = freePort()
+  result.url = "nats://127.0.0.1:" & $result.port
+  result.dir = getTempDir() / ("natsnim-test-" & $getCurrentProcessId())
+  createDir(result.dir)
+  result.logPath = result.dir / "server.log"
+  result.cfgPath = result.dir / "server.conf"
+  var cfg = "host: 127.0.0.1\nport: " & $result.port & "\n"
+  if maxPayload > 0:
+    cfg.add("max_payload: " & $maxPayload & "\n")
+  if extraConfig.len > 0:
+    cfg.add(extraConfig)
+  writeFile(result.cfgPath, cfg)
+  startServerProcess(result)
 
 proc stop*(srv: TestServer) =
   stopProcess(srv.process)

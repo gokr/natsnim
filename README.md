@@ -10,9 +10,10 @@ It is a **translation of the official Go client**
 than of `nats.c` — see [ASSESSMENT.md](ASSESSMENT.md) for the measurements
 and the reasoning.
 
-Status: **P1 + P2 landed** — parser, nuid, subject validation, the transport
-and the `natswrapper`-compatible shim, all covered by 54 tests. Not yet
-ported: reconnect/resubscribe (P5). See the phase plan in
+Status: **P1 + P2 + P5 landed** — parser, nuid, subject validation, the
+transport, the `natswrapper`-compatible shim and reconnect/resubscribe, all
+covered by 61 tests. Remaining: differential validation against `nats.c` (P6)
+and wiring Niffler onto it (P7). See the phase plan in
 [ASSESSMENT.md](ASSESSMENT.md#plan).
 
 ```nim
@@ -50,11 +51,38 @@ In (core NATS):
 - headers: HMSG is split into `headers` + `data`
 - request/reply with inboxes and timeouts, `flush`, `max_payload` enforcement
 - optional user/password from the URL
+- **reconnect + resubscribe** across a server restart, with publishes buffered
+  (bounded) while disconnected — see below
 
 Out (documented rather than half-ported): TLS, nkeys/JWT credentials,
-JetStream, KV/object store, micro, WebSocket, compression, automatic
-reconnect/backoff. This is a *core NATS, plaintext* client — plenty for a
-loopback bus, not a drop-in for a public NATS deployment.
+JetStream, KV/object store, micro, WebSocket, compression, and a server pool
+(one URL per connection). This is a *core NATS, plaintext* client — plenty for
+a loopback bus, not a drop-in for a public NATS deployment.
+
+## Reconnect
+
+Because there is no background thread, reconnection is **lazy**: it is driven
+by the calls that wait (`nextMsg`, `flush`, `request`), never by a timer. The
+consequences are worth knowing:
+
+- an outage is noticed when a read or write next fails — with a 1 ms poll that
+  is the poll interval, so detection is fast;
+- attempts are spaced by `reconnectWaitMs` (default 2000), so a polling loop
+  performs at most one attempt per window and never spins hot;
+- `flush(timeoutMs)` / `request(timeoutMs)` *wait out* the window within their
+  budget, so an 8 s flush survives a multi-second outage;
+- `nextMsg(timeoutMs)` spends its timeout and then raises: a lost connection is
+  an error, not a timeout;
+- subscriptions are re-registered **with their original sids**, so reply
+  subjects handed out before the outage still route afterwards;
+- publishes issued while disconnected are buffered (default 8 MiB,
+  `reconnectBufSize`) and delivered in order after the reconnect; past the cap
+  the publish **fails** rather than being silently dropped;
+- `reconnect: false` or `maxReconnects: 0` makes an outage fatal to the calls in
+  flight, and publishes then fail fast instead of buffering.
+
+`reconnectCount`, `reconnectAttempts` and `lastDisconnect` report what
+happened.
 
 ## Threading
 
