@@ -12,7 +12,7 @@ and the reasoning.
 
 Status: **P1 + P2 + P5 landed** — parser, nuid, subject validation, the
 transport, the `natswrapper`-compatible shim and reconnect/resubscribe, all
-covered by 61 tests. Remaining: differential validation against `nats.c` (P6)
+covered by 65 tests. Remaining: differential validation against `nats.c` (P6)
 and wiring Niffler onto it (P7). See the phase plan in
 [ASSESSMENT.md](ASSESSMENT.md#plan).
 
@@ -79,7 +79,12 @@ consequences are worth knowing:
   `reconnectBufSize`) and delivered in order after the reconnect; past the cap
   the publish **fails** rather than being silently dropped;
 - `reconnect: false` or `maxReconnects: 0` makes an outage fatal to the calls in
-  flight, and publishes then fail fast instead of buffering.
+  flight, and publishes then fail fast instead of buffering;
+- the reconnect *dial* has its own budget (`reconnectDialTimeoutMs`, default
+  2 s) rather than the initial `connectTimeoutMs`, because the attempt happens
+  inside a caller that must not be blocked for as long as a cold start may be;
+- attempts are jittered (`reconnectJitterMs`, default 100) so that a bus
+  restart does not have every component retrying in lockstep.
 
 `reconnectCount`, `reconnectAttempts` and `lastDisconnect` report what
 happened.

@@ -19,7 +19,8 @@
 ## README: TLS, nkeys/JWT, WebSocket, automatic reconnect/backoff (a dropped
 ## connection fails the calls in flight; resubscription is the caller's).
 
-import std/[deques, json, monotimes, nativesockets, net, os, strutils, tables, times]
+import std/[deques, json, monotimes, nativesockets, net, os, random, strutils,
+            tables, times]
 from std/posix import poll, TPollfd, Tnfds, POLLIN, POLLERR, POLLHUP, POLLNVAL
 
 import nats/parser
@@ -96,6 +97,7 @@ type
     reconnectCount*: int
     lastDisconnect*: string
     pending: string      ## publishes buffered while disconnected
+    rng: Rand
     serverErrors*: seq[string]
     pingsOut: int64
     pongsIn: int64
@@ -112,6 +114,15 @@ type
     reconnectBufSize*: int
       ## Outgoing publishes buffered while disconnected (default 8 MiB).
       ## Past it a publish fails instead of being dropped, as Go does.
+    reconnectDialTimeoutMs*: int
+      ## Budget for the *reconnect* dial (default 2000), separate from the
+      ## initial `connectTimeoutMs`. A reconnect happens inside a caller
+      ## (`nextMsg`/`flush`), so it must not block that caller for as long as
+      ## a cold start legitimately may. 0 means "reuse connectTimeoutMs".
+    reconnectJitterMs*: int
+      ## Random extra [0, jitter) added to `reconnectWaitMs` (default 100), so
+      ## that a bus restart does not have every component retrying in lockstep
+      ## — the reason nats.go adds jitter.
     reconnect*: bool
       ## Master switch (default true). With it off a lost connection is fatal
       ## to the calls in flight, which is what Niffler did before P5.
@@ -120,7 +131,9 @@ proc defaultDialOptions*(): DialOptions =
   DialOptions(connectTimeoutMs: defaultConnectTimeoutMs,
               handshakeTimeoutMs: defaultHandshakeTimeoutMs,
               reconnectWaitMs: 2000, maxReconnects: 60,
-              reconnectBufSize: 8 * 1024 * 1024, reconnect: true)
+              reconnectBufSize: 8 * 1024 * 1024,
+              reconnectDialTimeoutMs: 2000, reconnectJitterMs: 100,
+              reconnect: true)
 
 proc fail(msg: string) {.noreturn.} =
   raise newException(NatsError, msg)
@@ -407,6 +420,20 @@ proc flushPending(conn: Connection) =
   conn.writeDirect(conn.pending)
   conn.pending.setLen(0)
 
+proc dialTimeoutForAttempt*(opts: DialOptions): int =
+  ## The dial budget a *reconnect* attempt gets. Pure, so the decision is
+  ## testable without a black-hole network to demonstrate it on.
+  if opts.reconnectDialTimeoutMs > 0: opts.reconnectDialTimeoutMs
+  else: opts.connectTimeoutMs
+
+proc reconnectDelayMs*(opts: DialOptions, rng: var Rand): int =
+  ## The spacing before the next attempt: `reconnectWaitMs` plus jitter drawn
+  ## per call, so two components that lost the bus together do not retry in
+  ## lockstep. Pure apart from the RNG, so the jitter bounds are testable.
+  result = opts.reconnectWaitMs
+  if opts.reconnectJitterMs > 0:
+    result += rng.rand(opts.reconnectJitterMs - 1)
+
 proc tryReconnect(conn: Connection): bool =
   ## One attempt: dial, handshake, resubscribe, flush buffered publishes.
   ## Never called from a thread — the waiting calls drive it.
@@ -421,7 +448,7 @@ proc tryReconnect(conn: Connection): bool =
   conn.handshaking = true
   defer: conn.handshaking = false
   try:
-    conn.sock = connectSocket(conn.parts, conn.opts.connectTimeoutMs)
+    conn.sock = connectSocket(conn.parts, dialTimeoutForAttempt(conn.opts))
     # A fresh parser: a partial frame from the dead socket is meaningless, and
     # a new INFO is on its way.
     conn.parser = initParser()
@@ -456,7 +483,7 @@ proc ensureConnected(conn: Connection): bool =
     return false
   if conn.haveAttempt:
     let elapsed = (getMonoTime() - conn.lastAttempt).inMilliseconds
-    if elapsed < conn.opts.reconnectWaitMs.int64:
+    if elapsed < reconnectDelayMs(conn.opts, conn.rng).int64:
       return false
   conn.tryReconnect()
 
@@ -511,6 +538,8 @@ proc dial*(url: string, opts = defaultDialOptions()): Connection =
     pongsIn: 0,
     pingsOut: 0,
     serverErrors: @[])
+  result.rng = initRand(int64(epochTime() * 1_000_000.0) +
+                        int64(getCurrentProcessId()))
   result.setSink()
   result.sock = connectSocket(result.parts, opts.connectTimeoutMs)
   result.handshake()
