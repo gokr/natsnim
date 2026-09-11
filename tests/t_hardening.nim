@@ -149,6 +149,59 @@ proc runBusTests() =
       expect core.NatsError: discard s.nextMsg(0)
       s.unsubscribe() # explicit release is still harmless
 
+    test "publishes are on the wire when publish returns (cross-connection)":
+      # Go's flusher goroutine makes publishes visible to other connections
+      # without further calls; this design has no thread, so publish writes
+      # through. Regression for a batching attempt that deadlocked
+      # "publish on A, then read on B" patterns (t_shim's binary test).
+      let a = core.dial(srv.url)
+      defer: a.close()
+      let b = core.dial(srv.url)
+      defer: b.close()
+      let sub = b.subscribe("xconn")
+      b.flush()
+      a.publish("xconn", "cross")
+      check sub.nextMsg(2000).data == "cross"
+
+    test "publish/subscribe wire order is preserved":
+      let c = core.dial(srv.url)
+      defer: c.close()
+      c.publish("order", "early")
+      let s2 = c.subscribe("order")
+      c.publish("order", "late")
+      c.flush()
+      check s2.nextMsg(1000).data == "late"
+      expect core.NatsTimeout:
+        discard s2.nextMsg(50)
+
+    test "interleaved subjects deliver with correct subjects (token reuse)":
+      # The parser reuses the subject allocation when bytes match; alternating
+      # subjects must never leak one subject into another message.
+      let c = core.dial(srv.url)
+      defer: c.close()
+      let a = c.subscribe("subj.a")
+      let b = c.subscribe("subj.b")
+      c.flush()
+      for i in 0 ..< 50:
+        c.publish("subj.a", "a" & $i)
+        c.publish("subj.b", "b" & $i)
+      c.flush()
+      for i in 0 ..< 50:
+        check a.nextMsg(1000).data == "a" & $i
+        check b.nextMsg(1000).data == "b" & $i
+
+    test "a publish burst arrives complete and in order":
+      let c = core.dial(srv.url)
+      defer: c.close()
+      let s = c.subscribe("burst")
+      c.flush()
+      for i in 0 ..< 1000:
+        c.publish("burst", $i)
+      var got = 0
+      while got < 1000:
+        check s.nextMsg(2000).data == $got
+        inc got
+
     test "simultaneous server fixtures do not share directories or ports":
       let other = startServer()
       defer: other.stop()

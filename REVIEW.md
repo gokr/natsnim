@@ -259,18 +259,25 @@ batching related protocol writes. Add request latency/throughput benchmarks.
 
 ### Further optimizations, after correctness fixes
 
-- `readSome` allocates a new receive string every call; `readBuf` is unused.
-  Reuse storage via length-aware receive, while preserving payload ownership.
-- `publishRaw` builds a full extra frame copy; the parser and shim also copy
-  strings. Profile allocation volume and batch/reuse buffers before considering
-  more complicated zero-copy lifetimes.
-- Every request creates/subscribes/unsubscribes a new inbox. A shared wildcard
-  inbox and bounded request routing table can reduce protocol traffic, but is
-  a later architectural optimization, not necessary for the first safe release.
-- `deliver` constructs/splits a message before checking pending capacity.
-  Reject over-budget delivery first where possible.
-- `waitReadable` treats EINTR as a dead connection. Retry with the remaining
-  deadline instead of causing avoidable disconnect/reconnect churn on signals.
+Status after the hardening pass — all four are resolved or consciously
+retired:
+
+- ~~`readSome` allocates a new receive string every call; `readBuf` is
+  unused~~ — fixed: one reused receive buffer feeds the parser.
+- ~~`publishRaw` builds a full extra frame copy~~ — fixed: publishes assemble
+  into a reused output buffer (no per-publish concatenation), payloads ≥ 16
+  KiB on an empty buffer bypass it entirely, and multi-frame operations
+  coalesce into one write. Cross-call batching like nats.go's was attempted
+  and rejected: without a flusher thread it deadlocks "publish on A, read on
+  B" patterns (pinned by a regression test); publish now writes through.
+- ~~`deliver` constructs/splits a message before checking pending
+  capacity~~ — fixed: limits are checked before any message allocation.
+- ~~`waitReadable` treats EINTR as a dead connection~~ — fixed: EINTR retries
+  within the remaining deadline.
+
+Still open, deliberately: a shared wildcard request inbox (Go's mux) to
+remove the per-request SUB/UNSUB pair, and parser zero-copy payload delivery
+(owned strings are a safety choice; revisit only with benchmarks in hand).
 
 ## Cleanup and test quality
 

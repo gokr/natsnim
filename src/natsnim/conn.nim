@@ -4,6 +4,13 @@
 ## a component-local nonblocking state machine, driven only by public calls.
 ## One connection belongs to one thread. Close connections explicitly.
 ## Reconnect progresses across even zero/one-ms polls without a blocking dial.
+##
+## Writes: a publish is on the wire (within its write budget) when it returns
+## — there is no flusher thread to defer it, and callers must not need a
+## follow-up operation to push their data. The reused output buffer avoids a
+## fresh frame concatenation per publish; multi-frame operations (request's
+## SUB+PUB, batched PONG replies) coalesce into one write internally, and
+## publishes accepted during an outage are buffered for the reconnect.
 
 import std/[deques, json, monotimes, nativesockets, net, os, random, strutils,
             tables, times, uri]
@@ -22,6 +29,10 @@ const
   readChunk = 65536
   maxOptionMs = 86_400_000
   errorLimit = 32
+  directWriteMin = 16 * 1024
+    ## Payloads at least this large bypass the buffer: one kernel copy beats
+    ## buffer-copy plus kernel-copy for big frames.
+  crlf = "\r\n"
 
 type
   NatsError* = object of CatchableError
@@ -67,14 +78,12 @@ type
     received, autoMax, serverBaseReceived: int64
 
   Phase = enum offline, connecting, greeting, authenticating, validating, replaying, ready
-  BufferedPublish = object
-    frame: string
-    payloadLen: int
 
   Connection* = ref object
     sock: Socket
     readBuf: string
     parser: Parser
+    sink: Sink            ## parser callbacks, built once per connection
     subs: Table[int64, Subscription]
     infoValue: ServerInfo
     maxPayloadValue: int
@@ -88,10 +97,13 @@ type
     attempts, reconnects: int
     initialAttempt: bool
     disconnectReason: string
-    pending: seq[BufferedPublish]
+    pending: string         ## accepted-but-unsent publishes (reconnect buffer)
     pendingSize, queuedBytes: int
-    outgoing: string
-    outgoingOffset, replayCount: int
+    outgoing: string        ## staged handshake/replay frames
+    outgoingOffset: int
+    pendingStaged: int      ## bytes of `pending` staged into the current replay
+    outBuf: string          ## output buffer: publishes awaiting one write
+    outOffset: int
     rng: Rand
     ids: NuID
     errors: Deque[string]
@@ -117,6 +129,9 @@ proc lastDisconnect*(c: Connection): string = c.disconnectReason
 proc subscriptionCount*(c: Connection): int = c.subs.len
 proc pendingBytes*(c: Connection): int = c.queuedBytes
 proc bufferedBytes*(c: Connection): int = c.pendingSize
+proc unflushedBytes*(c: Connection): int =
+  ## Publish bytes accepted but not yet written to the socket.
+  c.outBuf.len - c.outOffset
 proc subject*(s: Subscription): string = s.subjectValue
 proc queue*(s: Subscription): string = s.queueValue
 proc sid*(s: Subscription): int64 = s.sidValue
@@ -171,7 +186,18 @@ proc noteDisconnect(c: Connection, reason: string) =
   c.disconnectReason = reason
   c.outgoing.setLen(0)
   c.outgoingOffset = 0
-  if wasReady: c.attempts = 0
+  if wasReady:
+    c.attempts = 0
+    # Publishes accepted before the outage but never written (the output
+    # buffer) join the reconnect buffer: accepted means buffered, never
+    # silently dropped. This may overshoot reconnectBufSize by at most one
+    # buffered batch; the cap still applies to new publishes. outOffset
+    # accounts for bytes a partial write already put on the wire.
+    if c.outOffset < c.outBuf.len:
+      c.pending.add(c.outBuf[c.outOffset .. ^1])
+      c.pendingSize += c.outBuf.len - c.outOffset
+  c.outBuf.setLen(0)
+  c.outOffset = 0
   c.nextAttemptAt = getMonoTime() + initDuration(
     milliseconds = reconnectDelayMs(c.opts, c.rng))
 proc outageReason(c: Connection): string =
@@ -221,12 +247,33 @@ proc sendWithin(c: Connection, data: string, offset: var int,
     if offset < data.len and getMonoTime() >= deadline: return false
   true
 
-proc writeDirect(c: Connection, data: string, deadline: MonoTime) =
+proc sendBytes(c: Connection, data: string, deadline: MonoTime) =
+  ## Direct write of one frame. Fatal on failure: a partially written frame
+  ## cannot be abandoned on a live fd, so the connection is marked lost.
   if c.sock == nil: fail("connection has no socket")
   var offset = 0
   if not c.sendWithin(data, offset, deadline):
     c.noteDisconnect("write timeout")
-    timeout("write")
+    fail("write timeout")
+
+proc flushOut(c: Connection, deadline: MonoTime) =
+  ## Write the buffered publishes to the socket as one send. Fatal on
+  ## failure; the unwritten remainder is salvaged into the reconnect buffer.
+  if c.outOffset >= c.outBuf.len:
+    c.outBuf.setLen(0)
+    c.outOffset = 0
+    return
+  if not c.sendWithin(c.outBuf, c.outOffset, deadline):
+    c.noteDisconnect("write timeout")
+    fail("write timeout")   # transport loss; remainder salvaged to pending
+  c.outBuf.setLen(0)
+  c.outOffset = 0
+
+proc sendNow(c: Connection, data: string, deadline: MonoTime) =
+  ## Ordered write: everything buffered earlier goes out first, so SUB/UNSUB/
+  ## PING/PONG frames never overtake publishes issued before them.
+  c.flushOut(deadline)
+  c.sendBytes(data, deadline)
 
 proc releaseBytes(s: Subscription, count: int) =
   s.bytes -= count
@@ -290,6 +337,17 @@ proc applyInfo(c: Connection, raw: string) =
   if c.infoValue.maxPayload <= 0: raise newException(ProtocolError, "invalid max_payload")
   c.maxPayloadValue = c.infoValue.maxPayload
 
+proc makeSink(c: Connection): Sink =
+  ## Parser callbacks closed over the connection. Built once in dial; the
+  ## cycle (connection -> sink -> connection) is broken in close().
+  proc onMsg(a: MsgArgs, p: string) = c.deliver(a, p)
+  proc onPing() = inc c.pendingPongs
+  proc onPong() = inc c.pongsIn
+  proc onInfo(raw: string) = c.applyInfo(raw)
+  proc onErr(text: string) = c.recordError(text)
+  Sink(onMsg: onMsg, onPing: onPing, onPong: onPong,
+       onInfo: onInfo, onErr: onErr)
+
 proc readSome(c: Connection, deadline: MonoTime): bool =
   if not c.pollSocket(POLLIN, deadline): return false
   c.readBuf.setLen(readChunk)
@@ -303,19 +361,11 @@ proc readSome(c: Connection, deadline: MonoTime): bool =
     c.noteDisconnect("connection closed by server")
     fail("connection closed by server")
   c.readBuf.setLen(n)
-  # Ephemeral closures: no Connection -> Sink -> Connection ownership cycle.
-  proc onMsg(a: MsgArgs, p: string) = c.deliver(a, p)
-  proc onPing() = inc c.pendingPongs
-  proc onPong() = inc c.pongsIn
-  proc onInfo(raw: string) = c.applyInfo(raw)
-  proc onErr(text: string) = c.recordError(text)
-  let sink = Sink(onMsg: onMsg, onPing: onPing, onPong: onPong,
-                  onInfo: onInfo, onErr: onErr)
   try:
     # The general parser accepts arbitrary caller callbacks. This invocation
-    # uses only the above closures over this thread-owned connection.
+    # uses only the connection-owned sink closures (built once in dial).
     {.cast(gcsafe).}:
-      let err = c.parser.parse(c.readBuf, sink)
+      let err = c.parser.parse(c.readBuf, c.sink)
       if err.len > 0: raise newException(ProtocolError, err)
   except CatchableError as e:
     c.noteDisconnect("protocol: " & e.msg)
@@ -325,7 +375,7 @@ proc readSome(c: Connection, deadline: MonoTime): bool =
   if c.pendingPongs > 0:
     let pongs = repeat("PONG\r\n", c.pendingPongs)
     c.pendingPongs = 0
-    c.writeDirect(pongs, deadline)
+    c.sendNow(pongs, deadline)
   if c.errors.len > 0:
     let text = c.errors.popFirst()
     if not c.connected or not text.contains("Permissions Violation"):
@@ -405,10 +455,12 @@ proc stageReplay(c: Connection) =
     text.add(" " & $sid & "\r\n")
     if sub.autoMax > 0:
       text.add("UNSUB " & $sid & " " & $(sub.autoMax - sub.received) & "\r\n")
-  for p in c.pending:
-    if p.payloadLen > c.maxPayload: fail("buffered publish exceeds new max_payload")
-    text.add(p.frame)
-  c.replayCount = c.pending.len
+  if c.pending.len > 0:
+    # Flat wire-format blob. Oversize was checked at publish time against the
+    # then-current max_payload; the server re-enforces its own limit and any
+    # -ERR surfaces through the normal error path.
+    text.add(c.pending)
+    c.pendingStaged = c.pending.len
   c.stage(text)
   c.phase = replaying
 
@@ -448,16 +500,16 @@ proc advanceAttempt(c: Connection, deadline: MonoTime): bool =
       if c.phase == authenticating:
         c.phase = validating
       else:
-        for i in 0 ..< c.replayCount: c.pendingSize -= c.pending[i].frame.len
-        c.pending = c.pending[c.replayCount .. ^1]
+        # The staged snapshot is on the wire: retire exactly those bytes and
+        # stage publishes that arrived meanwhile as a follow-up batch.
+        if c.pendingStaged > 0:
+          c.pendingSize -= c.pendingStaged
+          c.pending = c.pending[c.pendingStaged .. ^1]
+          c.pendingStaged = 0
         if c.pending.len > 0:
-          # New outage publishes appeared between polls. Their order follows
-          # the first snapshot; no duplicate SUBs are needed.
           var text = ""
-          for p in c.pending:
-            if p.payloadLen > c.maxPayload: fail("buffered publish exceeds new max_payload")
-            text.add(p.frame)
-          c.replayCount = c.pending.len
+          text.add(c.pending)
+          c.pendingStaged = c.pending.len
           c.stage(text)
         else:
           c.phase = ready
@@ -514,6 +566,9 @@ proc close*(c: Connection) =
   c.pending.setLen(0)
   c.pendingSize = 0
   c.outgoing.setLen(0)
+  c.outBuf.setLen(0)
+  c.outOffset = 0
+  c.sink = Sink()       # break connection -> sink -> connection
   c.readBuf.setLen(0)
 
 proc dial*(url: string, opts = defaultDialOptions()): Connection =
@@ -526,6 +581,7 @@ proc dial*(url: string, opts = defaultDialOptions()): Connection =
     initialAttempt: true, subs: initTable[int64, Subscription](),
     errors: initDeque[string](), ids: newNuID(),
     rng: initRand(int64(epochTime() * 1_000_000) + getCurrentProcessId().int64))
+  result.sink = makeSink(result)
   try:
     let ai = getAddrInfo(parts.host, Port(parts.port), AF_INET)
     defer: freeAddrInfo(ai)
@@ -565,7 +621,7 @@ proc subscribe*(c: Connection, subject: string, queue = "",
     var cmd = "SUB " & subject
     if queue.len > 0: cmd.add(" " & queue)
     cmd.add(" " & $result.sid & "\r\n")
-    try: c.writeDirect(cmd, untilMs(c.opts.writeTimeoutMs))
+    try: c.sendNow(cmd, untilMs(c.opts.writeTimeoutMs))
     except:
       result.detach(true)
       raise
@@ -580,15 +636,29 @@ proc unsubscribe*(s: Subscription, maxMsgs = 0) =
     if s.received < s.autoMax:
       if c.phase == replaying: c.noteDisconnect("subscriptions changed during replay")
       if c.connected:
-        try: c.writeDirect("UNSUB " & $s.sid & " " & $(maxMsgs.int64 - s.serverBaseReceived) & "\r\n", untilMs(c.opts.writeTimeoutMs))
+        try: c.sendNow("UNSUB " & $s.sid & " " & $(maxMsgs.int64 - s.serverBaseReceived) & "\r\n", untilMs(c.opts.writeTimeoutMs))
         except CatchableError: discard
       return
   if c != nil:
     if c.phase == replaying: c.noteDisconnect("subscriptions changed during replay")
     if not s.closed and c.connected:
-      try: c.writeDirect("UNSUB " & $s.sid & "\r\n", untilMs(c.opts.writeTimeoutMs))
+      try: c.sendNow("UNSUB " & $s.sid & "\r\n", untilMs(c.opts.writeTimeoutMs))
       except CatchableError: discard
   s.detach(maxMsgs == 0)
+
+proc stagePublish(c: Connection, h, data: string, deadline: MonoTime) =
+  ## Append one publish frame to the output buffer without flushing — or, for
+  ## large payloads on an empty buffer, write it straight through (one kernel
+  ## copy instead of buffer-copy plus kernel-copy). Callers that coalesce
+  ## several frames (request: SUB + PUB) flush explicitly.
+  if c.outBuf.len == 0 and data.len >= directWriteMin:
+    c.sendBytes(h, deadline)
+    c.sendBytes(data, deadline)
+    c.sendBytes(crlf, deadline)
+  else:
+    c.outBuf.add(h)
+    c.outBuf.add(data)
+    c.outBuf.add(crlf)
 
 proc publishRaw(c: Connection, subject, reply, data: string, deadline: MonoTime) =
   if c.closed: fail("connection is closed")
@@ -600,13 +670,22 @@ proc publishRaw(c: Connection, subject, reply, data: string, deadline: MonoTime)
     fail("payload exceeds server max_payload")
   let h = "PUB " & subject & (if reply.len > 0: " " & reply else: "") & " " & $data.len & "\r\n"
   if c.connected:
-    c.writeDirect(h & data & "\r\n", deadline)
+    # Go batches publishes behind a flusher goroutine; this design has no
+    # thread, so the wire-write happens here: a publish is on the wire
+    # (within the write budget) when it returns. Callers never need a
+    # follow-up operation to flush it, which also keeps cross-connection
+    # request/reply patterns deadlock-free. The reused output buffer avoids
+    # a fresh concatenation per publish; large payloads skip even its copy.
+    c.stagePublish(h, data, deadline)
+    c.flushOut(deadline)
     return
   if c.phase == offline and not c.reconnectEligible(): fail("publish: " & c.outageReason())
   let frameLen = h.len + data.len + 2
   if frameLen > c.opts.reconnectBufSize - c.pendingSize:
     fail("reconnect buffer exceeded")
-  c.pending.add(BufferedPublish(frame: h & data & "\r\n", payloadLen: data.len))
+  c.pending.add(h)
+  c.pending.add(data)
+  c.pending.add(crlf)
   c.pendingSize += frameLen
 
 proc publish*(c: Connection, subject, data: string) =
@@ -638,7 +717,11 @@ proc nextUntil(s: Subscription, deadline: MonoTime): Message =
     if c == nil or c.closed: fail("connection is closed")
     c.checkErrors()
     if not c.awaitUntil(deadline): timeout("reconnect")
-    try: discard c.readSome(deadline)
+    try:
+      # Deliver our own buffered writes before blocking on the socket: a
+      # publish enqueued by this caller must reach the server while we wait.
+      c.flushOut(deadline)
+      discard c.readSome(deadline)
     except ProtocolError: raise
     except NatsTimeout: raise
     except NatsError:
@@ -664,7 +747,9 @@ proc flush*(c: Connection, timeoutMs = defaultFlushTimeoutMs) =
   let deadline = untilMs(timeoutMs)
   c.checkErrors()
   if not c.awaitUntil(deadline): timeout("flush reconnect")
-  c.writeDirect("PING\r\n", deadline)
+  # Buffered publishes precede the barrier, or the PONG could outrun them.
+  c.flushOut(deadline)
+  c.sendBytes("PING\r\n", deadline)
   inc c.pingsOut
   while c.pongsIn < c.pingsOut:
     if getMonoTime() >= deadline: timeout("flush")
@@ -687,11 +772,18 @@ proc request*(c: Connection, subject, data: string,
     pendingByteLimit: defaultPendingBytes)
   c.subs[s.sid] = s
   try:
-    c.writeDirect("SUB " & inbox & " " & $s.sid & "\r\n", deadline)
-    c.publishRaw(subject, inbox, data, deadline)
+    if data.len >= directWriteMin:
+      # Large payload: write the SUB out, then let the publish bypass the
+      # buffer entirely (wire order is SUB before PUB either way).
+      c.sendNow("SUB " & inbox & " " & $s.sid & "\r\n", deadline)
+      c.publishRaw(subject, inbox, data, deadline)
+    else:
+      # Coalesce SUB + PUB into one write: publishRaw's flush sends both.
+      c.outBuf.add("SUB " & inbox & " " & $s.sid & "\r\n")
+      c.publishRaw(subject, inbox, data, deadline)
     result = s.nextUntil(deadline)
   finally:
     if c.connected:
-      try: c.writeDirect("UNSUB " & $s.sid & "\r\n", deadline)
+      try: c.sendNow("UNSUB " & $s.sid & "\r\n", deadline)
       except CatchableError: discard
     s.detach(true)

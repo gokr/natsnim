@@ -8,15 +8,17 @@ libsodium and protobuf-c. This project removes that.
 It is a **translation of the official Go client**
 ([`nats-io/nats.go`](https://github.com/nats-io/nats.go), Apache-2.0) rather
 than of `nats.c` — see [ASSESSMENT.md](ASSESSMENT.md) for the measurements
-and the reasoning.
+and the reasoning. It was created to serve as the bus client for the
+Niffler project, but it is a general-purpose core-NATS client with no
+knowledge of any application.
 
 Status: **P1 + P2 + P5 + hardening landed** — parser, nuid, subject
 validation, the transport, the `natswrapper`-compatible shim, reconnect and
 resubscribe, plus a review-driven hardening pass (bounded I/O with deadlines,
 explicit handle ownership, parser/queue limits, status fidelity). See
 [REVIEW.md](REVIEW.md) for what was found and how each item was fixed.
-Remaining: differential validation against `nats.c` (P6) and wiring Niffler
-onto it (P7). See the phase plan in [ASSESSMENT.md](ASSESSMENT.md#plan).
+Remaining: differential validation against `nats.c` (P6). See the phase plan
+in [ASSESSMENT.md](ASSESSMENT.md#plan).
 
 ```nim
 import natsnim         # the natswrapper-shaped surface
@@ -125,6 +127,45 @@ frames, permission errors, explicit server PING/PONG, and failed-dial fd
 leaks. `t_hardening.nim` pins ownership, bounds, status ordering,
 auto-unsubscribe semantics, exhausted-reconnect terminal behavior, and
 scheduler stability under repeated zero-timeout probes.
+
+Threads would only buy a push/callback API — precisely what a serialized
+polling pump does not want. The trade-off is explicit: **a connection is not
+safe for concurrent use from several threads**; a worker thread should own
+its own connection. See
+[ASSESSMENT.md](ASSESSMENT.md#transport-and-threading-contract).
+
+## Writes and output buffering
+
+There is no flusher goroutine, so the wire-write happens inside the calling
+operation: **a publish is on the socket (within its write budget) when
+`publish` returns.** Callers never need a follow-up operation to push their
+data — this is what keeps cross-connection request/reply patterns
+(`publish` on A, then block reading on B) deadlock-free, and it matches the
+observable behavior of libnats/nats.go, whose background flusher threads
+write a published message without further user action.
+
+What is still batched, internally and without changing that contract:
+
+- **Frame assembly reuse** — the publish header, payload and terminator are
+  appended into a per-connection buffer that is cleared after the write, so
+  a publish allocates no frame string at all; payloads at or above 16 KiB on
+  an empty buffer skip even that copy and are sent in place.
+- **Multi-frame operations** — `request` writes its inbox `SUB` and the
+  request `PUB` as one send; queued `PONG` keepalive replies leave in one
+  send.
+- **Reconnect buffering** — publishes accepted while disconnected are
+  buffered (bounded, see *Reconnect*) and replayed in order after the
+  reconnect, together with the resubscriptions.
+
+The performance consequence is measured in a head-to-head against `nats.go`
+(on loopback, medians of several rounds): connect/handshake and small
+request/reply are at parity or faster; large-payload request/reply runs
+~1.6–2.2× slower (the parser hands out owned payload copies rather than
+borrowing its read buffer); sustained publish fan-out is several times
+slower — one write syscall per publish instead of Go's batched background
+flushes. That last gap is the direct price of the no-thread design above;
+closing it would require either a flusher thread or an explicit
+batch-and-flush API, both deliberate non-goals for now.
 
 ## Threading
 

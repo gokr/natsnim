@@ -83,84 +83,122 @@ proc initParser*(maxControlLine = MAX_CONTROL_LINE_SIZE,
 
 # --- argument parsing -------------------------------------------------------
 
-proc splitArgs(arg: string): seq[string] =
-  ## Whitespace-split as upstream: separators are ' ', '\t', '\r' and '\n',
-  ## runs collapse and no empty token is produced.
-  var start = -1
-  for i, b in arg:
-    case b
-    of ' ', '\t', '\r', '\n':
-      if start >= 0:
-        result.add(arg[start ..< i])
-        start = -1
-    else:
-      if start < 0: start = i
-  if start >= 0:
-    result.add(arg[start ..< arg.len])
+proc sameBytes(s: string, d: string, start, stop: int): bool =
+  ## s equals d[start ..< stop]; comparison without allocation.
+  if s.len != stop - start: return false
+  for i in 0 ..< s.len:
+    if s[i] != d[start + i]: return false
+  true
 
-proc parseInt64*(d: string): int64 =
-  ## Decimal positive numbers; -1 signals an error (as upstream).
-  if d.len == 0: return -1
+proc setToken(field: var string, d: string, start, stop: int) =
+  ## Own a token's bytes, reusing the existing allocation when they match.
+  ## Subjects repeat heavily on a bus, so the common case is a byte compare
+  ## instead of a fresh string. A reused string is shared by reference and
+  ## never mutated: replacing it allocates a new one.
+  if not sameBytes(field, d, start, stop):
+    field = d[start ..< stop]
+
+proc nextToken(d: string, fromPos, stop: int): tuple[found: bool, s, e: int] =
+  ## Bounds of the next whitespace-delimited token within [fromPos, stop).
+  ## The stop bound is what keeps the trailing-token check from wandering
+  ## into the payload that follows the argument line.
+  var i = fromPos
+  while i < stop and d[i] in {' ', '\t', '\r', '\n'}: inc i
+  if i >= stop: return
+  result.s = i
+  while i < stop and d[i] notin {' ', '\t', '\r', '\n'}: inc i
+  result.e = i
+  result.found = true
+
+proc parseInt64Range(d: string, start, stop: int): int64 =
+  ## Decimal digits in [start, stop); -1 signals an error (as upstream).
+  ## Range-based so the hot path never allocates a token string.
+  if stop <= start: return -1
   var n = 0'i64
-  for dec in d:
+  for i in start ..< stop:
+    let dec = d[i]
     if dec < '0' or dec > '9': return -1
     let digit = int64(ord(dec)) - 48
     if n > (high(int64) - digit) div 10: return -1
     n = n * 10 + digit
   n
 
-proc boundedSize(d: string, limit: int): int =
-  let n = parseInt64(d)
+proc parseInt64*(d: string): int64 =
+  ## Decimal positive numbers; -1 signals an error (as upstream).
+  parseInt64Range(d, 0, d.len)
+
+proc boundedSizeRange(d: string, start, stop: int, limit: int): int =
+  let n = parseInt64Range(d, start, stop)
   if n < 0 or n > limit: -1 else: n.int
 
-proc processHeaderMsgArgs(p: var Parser, arg: string): string =
-  let args = splitArgs(arg)
-  case args.len
-  of 4:
-    p.ma.subject = args[0]
-    p.ma.sid = parseInt64(args[1])
-    p.ma.reply = ""
-    p.ma.hdr = boundedSize(args[2], p.maxPayload)
-    p.ma.size = boundedSize(args[3], p.maxPayload)
-  of 5:
-    p.ma.subject = args[0]
-    p.ma.sid = parseInt64(args[1])
-    p.ma.reply = args[2]
-    p.ma.hdr = boundedSize(args[3], p.maxPayload)
-    p.ma.size = boundedSize(args[4], p.maxPayload)
+proc processHeaderMsgArgs(p: var Parser, d: string, start, stop: int): string =
+  ## `HMSG subject sid [reply] hdr size` — tokens are scanned in place;
+  ## subject/reply strings are owned and reused when unchanged, numbers never
+  ## allocate. Error text matches upstream's splitArgs-based messages.
+  let quoted = d[start ..< stop]
+  template perr: string = "nats: processHeaderMsgArgs Parse Error: '" & quoted & "'"
+  var tok = nextToken(d, start, stop)
+  if not tok.found: return perr
+  setToken(p.ma.subject, d, tok.s, tok.e)
+  tok = nextToken(d, tok.e, stop)
+  if not tok.found: return perr
+  p.ma.sid = parseInt64Range(d, tok.s, tok.e)
+  let t3 = nextToken(d, tok.e, stop)
+  if not t3.found: return perr
+  let t4 = nextToken(d, t3.e, stop)
+  if not t4.found: return perr
+  let t5 = nextToken(d, t4.e, stop)
+  if t5.found:
+    setToken(p.ma.reply, d, t3.s, t3.e)
+    p.ma.hdr = boundedSizeRange(d, t4.s, t4.e, p.maxPayload)
+    p.ma.size = boundedSizeRange(d, t5.s, t5.e, p.maxPayload)
+    if nextToken(d, t5.e, stop).found: return perr
   else:
-    return "nats: processHeaderMsgArgs Parse Error: '" & arg & "'"
+    p.ma.reply = ""
+    p.ma.hdr = boundedSizeRange(d, t3.s, t3.e, p.maxPayload)
+    p.ma.size = boundedSizeRange(d, t4.s, t4.e, p.maxPayload)
   if p.ma.sid < 0:
-    return "nats: processHeaderMsgArgs Bad or Missing Sid: '" & arg & "'"
+    return "nats: processHeaderMsgArgs Bad or Missing Sid: '" & quoted & "'"
   if p.ma.hdr < 0 or p.ma.hdr > p.ma.size:
-    return "nats: processHeaderMsgArgs Bad or Missing Header Size: '" & arg & "'"
+    return "nats: processHeaderMsgArgs Bad or Missing Header Size: '" & quoted & "'"
   if p.ma.size < 0:
-    return "nats: processHeaderMsgArgs Bad or Missing Size: '" & arg & "'"
+    return "nats: processHeaderMsgArgs Bad or Missing Size: '" & quoted & "'"
+  ""
+
+proc processMsgArgsRange(p: var Parser, d: string, start, stop: int): string =
+  ## Parse the `MSG`/`HMSG` argument line into `p.ma`; "" on success. Valid
+  ## forms: `MSG subject sid size`, `MSG subject sid reply size`, and the
+  ## HMSG forms with a header length; anything else is upstream's Parse
+  ## Error. The parser's `hdr` field selects the HMSG variant.
+  if p.hdr >= 0:
+    return p.processHeaderMsgArgs(d, start, stop)
+  let quoted = d[start ..< stop]
+  template perr: string = "nats: processMsgArgs Parse Error: '" & quoted & "'"
+  var tok = nextToken(d, start, stop)
+  if not tok.found: return perr
+  setToken(p.ma.subject, d, tok.s, tok.e)
+  tok = nextToken(d, tok.e, stop)
+  if not tok.found: return perr
+  p.ma.sid = parseInt64Range(d, tok.s, tok.e)
+  let t3 = nextToken(d, tok.e, stop)
+  if not t3.found: return perr
+  let t4 = nextToken(d, t3.e, stop)
+  if t4.found:
+    setToken(p.ma.reply, d, t3.s, t3.e)
+    p.ma.size = boundedSizeRange(d, t4.s, t4.e, p.maxPayload)
+    if nextToken(d, t4.e, stop).found: return perr
+  else:
+    p.ma.reply = ""
+    p.ma.size = boundedSizeRange(d, t3.s, t3.e, p.maxPayload)
+  if p.ma.sid < 0:
+    return "nats: processMsgArgs Bad or Missing Sid: '" & quoted & "'"
+  if p.ma.size < 0:
+    return "nats: processMsgArgs Bad or Missing Size: '" & quoted & "'"
   ""
 
 proc processMsgArgs*(p: var Parser, arg: string): string =
-  ## Parse the `MSG` argument line into `p.ma`; "" on success.
-  if p.hdr >= 0:
-    return p.processHeaderMsgArgs(arg)
-  let args = splitArgs(arg)
-  case args.len
-  of 3:
-    p.ma.subject = args[0]
-    p.ma.sid = parseInt64(args[1])
-    p.ma.reply = ""
-    p.ma.size = boundedSize(args[2], p.maxPayload)
-  of 4:
-    p.ma.subject = args[0]
-    p.ma.sid = parseInt64(args[1])
-    p.ma.reply = args[2]
-    p.ma.size = boundedSize(args[3], p.maxPayload)
-  else:
-    return "nats: processMsgArgs Parse Error: '" & arg & "'"
-  if p.ma.sid < 0:
-    return "nats: processMsgArgs Bad or Missing Sid: '" & arg & "'"
-  if p.ma.size < 0:
-    return "nats: processMsgArgs Bad or Missing Size: '" & arg & "'"
-  ""
+  ## Whole-string entry point (tests and external callers).
+  p.processMsgArgsRange(arg, 0, arg.len)
 
 # --- the state machine ------------------------------------------------------
 
@@ -225,10 +263,12 @@ proc parse*(p: var Parser, buf: string, sink: Sink): string =
       of '\r':
         p.drop = 1
       of '\n':
-        var arg: string
-        if p.argActive: arg = p.argBuf
-        else: arg = buf[p.argStart ..< (i - p.drop)]
-        let e = p.processMsgArgs(arg)
+        # Scan the argument line in place: no arg-line string is allocated on
+        # the hot path (split lines still use argBuf).
+        let e = if p.argActive:
+          p.processMsgArgsRange(p.argBuf, 0, p.argBuf.len)
+        else:
+          p.processMsgArgsRange(buf, p.argStart, i - p.drop)
         if e.len > 0: return e
         p.drop = 0
         p.argStart = i + 1
