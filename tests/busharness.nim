@@ -1,152 +1,113 @@
-## Test harness: locate, start, stop and restart a real `nats-server`.
-##
-## The server is not vendored here (Niffler vendors its own build); the suite
-## looks for `$NATS_SERVER_BIN`, then `nats-server` on PATH. When neither
-## exists the bus suites print a loud SKIPPED banner and pass — the parser,
-## nuid, subject and fixture tests need no server.
-##
-## Configuration goes through a generated config file rather than CLI flags:
-## `max_payload` is a config-file-only setting in upstream nats-server (the
-## Niffler fork patches the CLI), so `-c` is the portable choice. The file is
-## kept around so the server can be *restarted on the same port*, which is what
-## the reconnect tests need.
+## Private, restartable real-server fixtures. NATS_SERVER_BIN overrides PATH.
+## NATS_REQUIRE_SERVER=1 makes missing integration prerequisites a test failure.
 
-import std/[net, os, osproc, strutils, times]
-
+import std/[json, net, os, osproc, tempfiles, times]
 import natsnim/conn as core
 
-type
-  TestServer* = object
-    bin*: string
-    process: Process
-    url*: string
-    port*: int
-    dir*: string
-    logPath*: string
-    cfgPath*: string
+type TestServer* = object
+  bin*: string
+  process: Process
+  url*: string
+  port*: int
+  dir*, logPath*, cfgPath*: string
 
 proc serverBinary*(): string =
-  ## "" when no server binary is available.
-  result = getEnv("NATS_SERVER_BIN")
-  if result.len > 0 and fileExists(result): return
-  let path = getEnv("PATH")
-  for dir in path.split(PathSep):
-    if dir.len == 0: continue
-    let cand = dir / "nats-server"
-    if fileExists(cand): return cand
-  result = ""
-
+  let configured = getEnv("NATS_SERVER_BIN")
+  if configured.len > 0:
+    if not fileExists(configured):
+      raise newException(IOError, "NATS_SERVER_BIN does not exist")
+    return configured
+  findExe("nats-server")
 proc serverAvailable*(): bool = serverBinary().len > 0
 
 proc freePort*(): int =
+  ## Only for legacy external probes; real fixtures use server-assigned ports.
   let s = newSocket()
   defer: s.close()
   s.bindAddr(Port(0), "127.0.0.1")
-  result = int(s.getLocalAddr()[1])
+  int(s.getLocalAddr()[1])
 
 proc stopProcess*(p: Process) =
-  ## terminate, then kill if it does not go within 2s. std/osproc's
-  ## waitForExit returns the exit code (and -1 on timeout), so poll `running`.
   if p == nil: return
   try:
-    p.terminate()
-    var waited = 0
-    while p.running() and waited < 2000:
-      sleep(20)
-      waited += 20
-    if p.running(): p.kill()
-  except CatchableError:
-    discard
-  p.close()
+    if p.running():
+      p.terminate()
+      if p.waitForExit(2000) == -1 and p.running():
+        p.kill()
+        discard p.waitForExit(2000)
+  finally: p.close()
 
 proc startServerProcess*(srv: var TestServer) =
-  ## Spawn the server from the existing config and wait until it answers a
-  ## full handshake (a partially started server is never mistaken for ready).
+  ## The ports file and live child are an independent readiness oracle: do not
+  ## rely solely on the client implementation whose handshake we are testing.
+  for path in walkFiles(srv.dir / "*.ports"): removeFile(path)
   srv.process = startProcess(srv.bin, args = @["-c", srv.cfgPath,
-                                              "-l", srv.logPath],
-                             options = {poUsePath, poDaemon})
-  let deadline = epochTime() + 10.0
-  var lastErr = ""
-  while epochTime() < deadline:
-    try:
-      let c = core.dial(srv.url)
-      c.close()
-      return
-    except CatchableError as e:
-      lastErr = e.msg
-      sleep(50)
-  let log = if fileExists(srv.logPath): readFile(srv.logPath) else: "(no log)"
-  raise newException(IOError, "nats-server did not become ready at " &
-    srv.url & " (last: " & lastErr & ")\n--- server log ---\n" & log)
+    "-p", $srv.port, "-l", srv.logPath, "--ports_file_dir", srv.dir],
+    options = {poUsePath, poDaemon})
+  try:
+    let deadline = epochTime() + 10.0
+    while epochTime() < deadline:
+      if not srv.process.running(): break
+      for path in walkFiles(srv.dir / "*.ports"):
+        let ports = parseFile(path)
+        if ports{"nats"} != nil and ports["nats"].len > 0:
+          srv.url = ports["nats"][0].getStr()
+          srv.port = core.parseUrl(srv.url).port
+          return
+      sleep(20)
+    let log = if fileExists(srv.logPath): readFile(srv.logPath) else: "(no log)"
+    raise newException(IOError, "nats-server did not become ready\n" & log)
+  except:
+    stopProcess(srv.process)
+    srv.process = nil
+    raise
 
 proc stopServerProcess*(srv: var TestServer) =
-  ## Kill the server but keep the config and directory, so it can be started
-  ## again on the same port.
   stopProcess(srv.process)
   srv.process = nil
-
 proc restart*(srv: var TestServer) =
-  ## Stop and start again on the same port — the outage a client must survive.
-  stopServerProcess(srv)
-  startServerProcess(srv)
-
+  srv.stopServerProcess()
+  srv.startServerProcess()
 proc startServer*(maxPayload = 1024, extraConfig = ""): TestServer =
-  ## Start a private server in its own temp dir. `maxPayload` is small by
-  ## default so the client-side guard is exercised without large payloads.
   result.bin = serverBinary()
-  if result.bin.len == 0:
-    raise newException(IOError, "no nats-server binary available")
-  result.port = freePort()
-  result.url = "nats://127.0.0.1:" & $result.port
-  result.dir = getTempDir() / ("natsnim-test-" & $getCurrentProcessId())
-  createDir(result.dir)
+  if result.bin.len == 0: raise newException(IOError, "no nats-server available")
+  result.port = -1
+  result.dir = createTempDir("natsnim-test-", "")
   result.logPath = result.dir / "server.log"
   result.cfgPath = result.dir / "server.conf"
-  var cfg = "host: 127.0.0.1\nport: " & $result.port & "\n"
-  if maxPayload > 0:
-    cfg.add("max_payload: " & $maxPayload & "\n")
-  if extraConfig.len > 0:
-    cfg.add(extraConfig)
+  var cfg = "host: 127.0.0.1\n"
+  if maxPayload > 0: cfg.add("max_payload: " & $maxPayload & "\n")
+  cfg.add(extraConfig)
   writeFile(result.cfgPath, cfg)
-  startServerProcess(result)
-
+  try: result.startServerProcess()
+  except:
+    removeDir(result.dir)
+    raise
 proc stop*(srv: TestServer) =
   stopProcess(srv.process)
-  if srv.dir.len > 0:
-    try: removeDir(srv.dir)
-    except CatchableError: discard
+  if srv.dir.len > 0: removeDir(srv.dir)
 
 proc startResponder*(url, subject: string, prefix = ""): Process =
-  ## Spawn the echo-responder fixture and wait until it is subscribed.
-  ## `request()` blocks while waiting for the reply, so the other party has to
-  ## be a separate process.
   let bin = getAppDir() / "responder"
-  if not fileExists(bin):
-    raise newException(IOError, "responder fixture not built at " & bin)
-  let ready = getTempDir() / ("natsnim-responder-" &
-    $getCurrentProcessId() & "-" & $freePort())
-  removeFile(ready)
+  if not fileExists(bin): raise newException(IOError, "responder fixture missing")
+  let dir = createTempDir("natsnim-responder-", "")
+  defer: removeDir(dir)
+  let ready = dir / "ready"
   var args = @[url, subject]
   if prefix.len > 0: args.add(prefix)
-  args.add("--ready")
-  args.add(ready)
+  args.add(["--ready", ready])
   result = startProcess(bin, args = args, options = {poUsePath, poDaemon})
-  let deadline = epochTime() + 8.0
-  while not fileExists(ready):
-    if epochTime() > deadline:
-      stopProcess(result)
-      raise newException(IOError, "responder never became ready")
-    sleep(25)
-  removeFile(ready)
-
-proc stopResponder*(p: Process) =
-  stopProcess(p)
-
+  try:
+    let deadline = epochTime() + 8.0
+    while not fileExists(ready):
+      if not result.running() or epochTime() > deadline:
+        raise newException(IOError, "responder never became ready")
+      sleep(20)
+  except:
+    stopProcess(result)
+    raise
+proc stopResponder*(p: Process) = stopProcess(p)
 proc skipBanner*() =
-  echo ""
-  echo "  ***************************************************************"
-  echo "  * SKIPPED: no nats-server found.                              *"
-  echo "  * Set NATS_SERVER_BIN=/path/to/nats-server (or put it on PATH) *"
-  echo "  * to run the core-NATS transport tests.                       *"
-  echo "  ***************************************************************"
-  echo ""
+  if getEnv("NATS_REQUIRE_SERVER") == "1":
+    raise newException(IOError, "required nats-server is missing")
+  echo "SKIPPED real-server tests: set NATS_SERVER_BIN or install nats-server."

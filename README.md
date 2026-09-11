@@ -10,11 +10,13 @@ It is a **translation of the official Go client**
 than of `nats.c` — see [ASSESSMENT.md](ASSESSMENT.md) for the measurements
 and the reasoning.
 
-Status: **P1 + P2 + P5 landed** — parser, nuid, subject validation, the
-transport, the `natswrapper`-compatible shim and reconnect/resubscribe, all
-covered by 65 tests. Remaining: differential validation against `nats.c` (P6)
-and wiring Niffler onto it (P7). See the phase plan in
-[ASSESSMENT.md](ASSESSMENT.md#plan).
+Status: **P1 + P2 + P5 + hardening landed** — parser, nuid, subject
+validation, the transport, the `natswrapper`-compatible shim, reconnect and
+resubscribe, plus a review-driven hardening pass (bounded I/O with deadlines,
+explicit handle ownership, parser/queue limits, status fidelity). See
+[REVIEW.md](REVIEW.md) for what was found and how each item was fixed.
+Remaining: differential validation against `nats.c` (P6) and wiring Niffler
+onto it (P7). See the phase plan in [ASSESSMENT.md](ASSESSMENT.md#plan).
 
 ```nim
 import natsnim         # the natswrapper-shaped surface
@@ -92,6 +94,38 @@ consequences are worth knowing:
 `reconnectCount`, `reconnectAttempts` and `lastDisconnect` report what
 happened.
 
+## Transport hardening
+
+A 2026-09-11 review (see [REVIEW.md](REVIEW.md)) found real lifecycle bugs the
+happy-path suites cannot reach. The transport was rebuilt around four
+contracts, each pinned by regression tests:
+
+- **Deadlines are absolute.** Every public operation computes one deadline at
+  entry; dial, handshake, write, reconnect pacing and response waiting all
+  share it. A 20 ms `request` can never spend 5 s in a stalled write, and
+  `nextMsg(5)` can never lose 400 ms to one reconnect handshake. Zero-timeout
+  polls still make bounded nonblocking progress — short polls can finish a
+  delayed handshake instead of restarting it forever.
+- **Handles are owned.** `ptr natsMsg` / `ptr natsSubscription` /
+  `ptr natsConnection` are raw allocations freed by their Destroy procs
+  (message payloads included); failed construction is cleaned up. 2,000
+  destroyed messages now retain nothing measurable.
+- **Untrusted input is bounded.** Parser numeric fields are checked
+  conversions, control lines and payloads have enforced limits, subscription
+  queues have byte budgets (per-subscription and per-connection), and
+  malformed status/header frames fail as `NatsError`, never as Defects.
+- **Writes are exact.** All sends use pointer/length send with explicit
+  offsets (no std/net partial-write/SafeDisconn loop), `poll(2)` readiness,
+  EINTR retry, and `TCP_NODELAY` — a local 20-request probe went from
+  ~829 ms to ~3.5 ms with no batching.
+
+Adversarial coverage lives in `tests/t_faultpeer.py`: deterministic fake
+peers for stalled/partial writes, delayed INFO, auth refusal, malformed
+frames, permission errors, explicit server PING/PONG, and failed-dial fd
+leaks. `t_hardening.nim` pins ownership, bounds, status ordering,
+auto-unsubscribe semantics, exhausted-reconnect terminal behavior, and
+scheduler stability under repeated zero-timeout probes.
+
 ## Threading
 
 **Synchronous: no `asyncdispatch`, no threads, no callbacks.** The socket is
@@ -107,14 +141,16 @@ connection. See [ASSESSMENT.md](ASSESSMENT.md#transport-and-threading-contract).
 ## Tests
 
 ```bash
-nimble test
+nimble test            # skips real-server suites when no nats-server is found
+nimble testRequired    # same, but a missing nats-server is a failure
+nimble bench           # local request-latency microbenchmark (diagnostic)
 ```
 
-The parser, nuid, subject and pending-limit tests need nothing else. The two
+The parser, nuid, subject and pending-limit tests need nothing else. The
 transport suites start a real `nats-server` and **skip loudly** when none is
-found — point `NATS_SERVER_BIN` at one, or put `nats-server` on `PATH`. They
-are configured through a generated config file because `max_payload` is a
-config-only setting in upstream nats-server.
+found — point `NATS_SERVER_BIN` at one, or put `nats-server` on `PATH`. Fixtures
+use server-assigned ports, per-suite temp directories, and a ports-file
+readiness oracle rather than the client under test.
 
 Beyond upstream's coverage, the suites assert: chunk-boundary invariance of
 the parser under randomized splits (including payloads containing `\r\n`,
@@ -122,7 +158,8 @@ the parser under randomized splits (including payloads containing `\r\n`,
 `-ERR`/`INFO` argument quirks, `nextMsg(0)` not waiting, a message for
 subscription B surviving a blocking wait on A, coalesced frames, queue-group
 exactly-once delivery, fail-loud pending limits, binary payloads with NUL
-bytes, and HMSG from a raw `HPUB` peer.
+bytes, and HMSG from a raw `HPUB` peer — plus the hardening regressions and
+adversarial fake-peer scenarios listed under *Transport hardening*.
 
 ## Implementation notes
 

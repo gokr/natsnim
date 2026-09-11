@@ -19,3 +19,14 @@ task test, "Run the test suite":
   exec "nim c -r --hints:off --path:src -o:tests/bin/t_shim tests/t_shim.nim"
   exec "nim c -r --hints:off --path:src -o:tests/bin/t_reconnect_opts tests/t_reconnect_opts.nim"
   exec "nim c -r --hints:off --path:src -o:tests/bin/t_reconnect tests/t_reconnect.nim"
+  exec "nim c -r --hints:off --path:src -o:tests/bin/t_hardening tests/t_hardening.nim"
+  exec "nim c -r --hints:off --threads:on --path:src -o:tests/bin/t_threads tests/t_threads.nim"
+  exec "nim c --hints:off --path:src -o:tests/bin/faultclient tests/faultclient.nim"
+  exec "python3 tests/t_faultpeer.py"
+
+task testRequired, "Run all tests; fail if nats-server is missing":
+  putEnv("NATS_REQUIRE_SERVER", "1")
+  exec "nimble test"
+
+task bench, "Local request latency microbenchmark":
+  exec "nim c -r -d:release --hints:off --path:src -o:tests/bin/bench_requests tests/bench_requests.nim"

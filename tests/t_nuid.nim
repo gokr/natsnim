@@ -17,7 +17,7 @@ suite "nuid":
   test "a new generator is initialised (TestGlobalNUIDInit)":
     let n = newNuID()
     check n.pre.len == preLen
-    check n.seq != 0
+    check n.seq >= 0 and n.seq < maxSeq
 
   test "rollover re-randomises the prefix (TestNUIDRollover)":
     var n = newNuID(1)

@@ -14,7 +14,7 @@
 ##   * binary payloads (NUL bytes) survive byte-for-byte,
 ##   * HMSG from a raw `HPUB` peer is split into headers + body.
 
-import std/[net, os, osproc, sets, strutils, times, unittest]
+import std/[net, sets, strutils, times, unittest]
 import natsnim/conn as core
 import busharness
 
@@ -312,14 +312,8 @@ proc runTests(url: string, port: int) =
       check m.data == body
       check m.size == hdrs.len + body.len
 
-    test "the client answers the server's PING (idle connection stays up)":
-      let c = core.dial(url)
-      defer: c.close()
-      let sub = c.subscribe("t.keepalive")
-      c.flush()
-      sleep(1200)                     # server ping interval is 2 min by
-      c.publish("t.keepalive", "alive")   # default; this mostly proves we do
-      check sub.nextMsg(2000).data == "alive"  # not misparse inbound PINGs
+    # Server-PING behavior is tested by t_faultpeer.py's explicit PING/PONG
+    # exchange, not by sleeping less than the real server's ping interval.
 
 proc main() =
   if not serverAvailable():

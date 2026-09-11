@@ -10,7 +10,7 @@
 ##   * a timeout is a *status* (`NATS_TIMEOUT`), not an error, while a real
 ##     failure is `NATS_ERR` with a message from `getErrorString`.
 
-import std/[os, osproc, strutils, times, unittest]
+import std/[os, strutils, times, unittest]
 import natsnim
 import busharness
 
@@ -68,6 +68,7 @@ proc runTests(url: string) =
       var msg: ptr natsMsg
       check natsSubscription_NextMsg(addr msg, sub, 0) == NATS_OK
       check $natsMsg_GetData(msg) == "x"
+      natsMsg_Destroy(msg)
       natsSubscription_Destroy(sub)
 
     test "QueueSubscribeSync shares one message across the group":
@@ -87,6 +88,8 @@ proc runTests(url: string) =
       if natsSubscription_NextMsg(addr m1, s1, 500) == NATS_OK: inc got
       if natsSubscription_NextMsg(addr m2, s2, 500) == NATS_OK: inc got
       check got == 1                     # exactly one member got it
+      natsMsg_Destroy(m1)
+      natsMsg_Destroy(m2)
       natsSubscription_Destroy(s1)
       natsSubscription_Destroy(s2)
 
@@ -116,13 +119,13 @@ proc runTests(url: string) =
                   $int(epochTime() * 1000)
       var rep: ptr natsSubscription
       check natsConnection_SubscribeSync(addr rep, requester.conn,
-                                         inbox) == NATS_OK
+                                         inbox.cstring) == NATS_OK
       check natsConnection_FlushTimeout(responder.conn, 2000) == NATS_OK
       check natsConnection_FlushTimeout(requester.conn, 2000) == NATS_OK
 
       let binary = "\x00\x01\x02\xff\x00tail"
       check natsConnection_PublishRequest(requester.conn, "shim.bin",
-                                          inbox, binary.cstring,
+                                          inbox.cstring, binary.cstring,
                                           binary.len.cint) == NATS_OK
 
       var req: ptr natsMsg
@@ -135,7 +138,7 @@ proc runTests(url: string) =
       # answer, then read it back on the requester side. The reply must use
       # the length-based publish: PublishString is NUL-terminated.
       let reply = "\x00reply\x00"
-      check natsConnection_Publish(responder.conn, replySubject,
+      check natsConnection_Publish(responder.conn, replySubject.cstring,
                                    reply.cstring, reply.len.cint) == NATS_OK
       var got: ptr natsMsg
       check natsSubscription_NextMsg(addr got, rep, 2000) == NATS_OK

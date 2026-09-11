@@ -19,7 +19,7 @@
 ##     then publishes fail fast rather than buffering forever,
 ##   * an explicit `close` is not an outage: nothing reconnects.
 
-import std/[os, strutils, times, unittest]
+import std/[strutils, times, unittest]
 import natsnim/conn as core
 import busharness
 
@@ -38,13 +38,14 @@ proc noticeOutage(c: core.Connection, sub: core.Subscription) =
   for _ in 0 ..< 40:
     try:
       discard sub.nextMsg(100)
-    except core.NatsError:
-      return
     except core.NatsTimeout:
-      discard
+      if not c.connected: return
+    except core.NatsError:
+      if not c.connected: return
+      raise
   doAssert false, "client never noticed the outage"
 
-proc runTests(url: string) =
+proc runTests() =
 
   suite "reconnect":
 
@@ -191,6 +192,9 @@ proc runTests(url: string) =
       except core.NatsError:
         raised = true
       check raised
+      expect core.NatsError:
+        c.publish("r.zero", "must not buffer forever")
+      check c.bufferedBytes == 0
 
     test "an explicit close is not an outage: nothing reconnects":
       var srv = startServer(maxPayload = 1024)
@@ -236,11 +240,6 @@ proc main() =
   if not serverAvailable():
     skipBanner()
     quit(0)
-  # The suite starts its own server per test (restarts are the point).
-  discard
-  let srv = startServer(maxPayload = 1024)
-  let url = srv.url
-  srv.stop()
-  runTests(url)
+  runTests()
 
 main()

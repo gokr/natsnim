@@ -12,13 +12,12 @@
 ##    than Go's globally seeded `math/rand`. The *contract* is identical
 ##    (random start, increment in [33,333), re-randomise at rollover); the
 ##    particular values differ, as they do between any two PRNGs.
-##  - the process-global generator is a plain global, **not thread-safe**: a
-##    connection is single-threaded by design (see README). Go guards it with
-##    a mutex because goroutines may call `Next` concurrently.
+##  - the convenience generator is thread-local; connections also own their
+##    own generator. Separate connection owners share no mutable NUID state.
 ##  - `newNuID(seed)` is exposed so tests are deterministic; upstream seeds
 ##    from crypto entropy only.
 
-import std/[math, random, times]
+import std/[random, times]
 import std/sysrand
 
 const
@@ -57,15 +56,14 @@ proc randomizePrefix*(n: var NuID) =
 
 proc resetSequential*(n: var NuID) =
   ## New random start and increment for the sequential part.
-  n.seq = n.r.rand(maxSeq)
-  n.inc = minInc + n.r.rand(maxInc - minInc)
+  n.seq = n.r.rand(maxSeq - 1)
+  n.inc = minInc + n.r.rand(maxInc - minInc - 1)
 
 proc newNuID*(seed = 0'i64): NuID =
   ## `seed == 0` seeds from crypto entropy (upstream behaviour); a non-zero
   ## seed makes the sequential part deterministic.
   result.r = initRand(if seed != 0: seed else: entropySeed())
-  result.seq = result.r.rand(maxSeq)
-  result.inc = minInc + result.r.rand(maxInc - minInc)
+  result.resetSequential()
   result.randomizePrefix()
 
 proc next*(n: var NuID): string =
@@ -86,12 +84,11 @@ proc next*(n: var NuID): string =
   for k in 0 ..< totalLen: result[k] = b[k]
 
 var
-  globalNuID: NuID
-  globalReady = false
+  globalNuID {.threadvar.}: NuID
+  globalReady {.threadvar.}: bool
 
 proc nextId*(): string =
-  ## The process-global generator (upstream `Next()`). Not thread-safe by
-  ## design: one connection per thread.
+  ## Thread-local convenience generator (upstream `Next()`).
   if not globalReady:
     globalNuID = newNuID()
     globalReady = true

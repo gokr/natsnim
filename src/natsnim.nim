@@ -1,24 +1,21 @@
-## nats.nim — pure-Nim NATS client (core NATS).
+## Pure-Nim NATS client (core NATS), natswrapper-shaped compatibility API.
 ##
 ## Two layers:
 ##
-##   * `nats/conn` — the idiomatic Nim API (`Connection`, `Subscription`,
+##   * `natsnim/conn` — the idiomatic Nim API (`Connection`, `Subscription`,
 ##     `Message`, `dial`, `publish`, `nextMsg`, …). Use that directly.
 ##   * this module — the **shim contract**: the subset of `natswrapper` (a
 ##     Futhark FFI binding over `nats.c`) that Niffler's Nim sources use, with
 ##     the same names and signatures, so adopting this library is a `requires`
 ##     change and `sdk/niffler/sdk.nim` does not move.
 ##
-## Handle semantics: `ptr natsConnection` / `ptr natsSubscription` /
-## `ptr natsMsg` point at GC-managed objects (`create`). The `*Destroy` procs
-## therefore only *detach* (unsubscribe, close) — the collector reclaims the
-## memory once the caller drops the pointer, so callers must drop it as they
-## do after `nats.c`'s destroy.
+## Pointer handles are explicitly owned, like the C API: each successful
+## allocation needs exactly one matching Destroy (or close for the convenience
+## connection). Copies of NatsConnection are borrowed aliases, not new owners;
+## destroying one invalidates every alias. Never use or destroy a freed handle.
 ##
 ## Not thread-safe (see README): one connection per thread.
 
-import std/[json, strutils]
-import natsnim/parser
 import natsnim/conn as core
 export NoRespondersError
 
@@ -53,11 +50,11 @@ const
     ## (only `checkStatus` and `== NATS_TIMEOUT` are contractual); nats.c's
     ## internal enum is not part of this library's interface.
 
-var lastErrorText = ""
+var lastErrorText {.threadvar.}: string
 
 proc getErrorString*(status: natsStatus): string =
   ## Status text. For NATS_ERR this is the most recent shim error, mirroring
-  ## `nats_GetLastError` (not thread-safe, like the rest of this module).
+  ## `nats_GetLastError`. Error state belongs to the calling thread.
   case status
   of NATS_OK: "ok"
   of NATS_TIMEOUT: "timeout"
@@ -78,7 +75,9 @@ proc setErr(msg: string): natsStatus {.discardable.} =
 
 proc cstrToStr(p: cstring, n: cint): string =
   ## cstring + length: binary-safe (a payload may contain NUL bytes).
-  if p == nil or n <= 0: return ""
+  if n < 0 or (p == nil and n > 0):
+    raise newException(ValueError, "invalid payload pointer/length")
+  if n == 0: return ""
   result = newString(n.int)
   copyMem(addr result[0], p, n.int)
 
@@ -86,7 +85,7 @@ proc cstrToStr(p: cstring, n: cint): string =
 
 proc nats_Open*(sleepMs: int): natsStatus {.discardable.} =
   ## Kept for API compatibility: a pure-Nim client has no global C state to
-  ## initialise, and the process-global NUID seeds itself lazily.
+  ## initialise; inbox generators are connection-owned.
   discard sleepMs
   NATS_OK
 
@@ -98,17 +97,20 @@ proc nats_Close*() =
 proc connect*(url: string = "nats://localhost:4222"): NatsConnection =
   ## Connect and complete the INFO/CONNECT handshake. Raises IOError on
   ## failure, as natswrapper's `connect` does.
-  var handle = create(natsConnection)
   try:
-    handle.impl = core.dial(url)
+    let impl = core.dial(url)
+    let handle = create(natsConnection)
+    handle.impl = impl
+    result.conn = handle
   except CatchableError as e:
     lastErrorText = e.msg
     raise newException(IOError, "Failed to connect: " & e.msg)
-  result.conn = handle
 
 proc close*(nc: var NatsConnection) =
   if nc.conn != nil:
     nc.conn.impl.close()
+    reset(nc.conn[])
+    dealloc(nc.conn)
     nc.conn = nil
 
 proc publish*(nc: NatsConnection, subject: string, data: string) =
@@ -178,12 +180,13 @@ proc natsConnection_Flush*(conn: ptr natsConnection): natsStatus {.discardable.}
 
 proc natsConnection_GetMaxPayload*(conn: ptr natsConnection): cint =
   let c = rawConn(conn)
-  if c == nil: 0.cint else: cint(c.maxPayload)
+  if c == nil: 0.cint else: cint(min(c.maxPayload, high(cint).int))
 
 proc natsConnection_Destroy*(conn: ptr natsConnection) =
-  if conn != nil and conn.impl != nil:
-    conn.impl.close()
-    conn.impl = nil
+  if conn != nil:
+    if conn.impl != nil: conn.impl.close()
+    reset(conn[])
+    dealloc(conn)
 
 # --- subscribe / publish-request -------------------------------------------
 
@@ -203,6 +206,8 @@ proc subscribeSync(conn: ptr natsConnection, subject: string,
 proc natsConnection_SubscribeSync*(sub: ptr ptr natsSubscription,
                                    conn: ptr natsConnection,
                                    subject: cstring): natsStatus {.discardable.} =
+  if sub == nil: return setErr("subscribe: nil output pointer")
+  sub[] = nil
   let (st, handle) = subscribeSync(conn, $subject, "")
   if st == NATS_OK: sub[] = handle
   st
@@ -210,6 +215,8 @@ proc natsConnection_SubscribeSync*(sub: ptr ptr natsSubscription,
 proc natsConnection_QueueSubscribeSync*(sub: ptr ptr natsSubscription,
                                         conn: ptr natsConnection,
                                         subject, queue: cstring): natsStatus {.discardable.} =
+  if sub == nil: return setErr("subscribe: nil output pointer")
+  sub[] = nil
   let (st, handle) = subscribeSync(conn, $subject, $queue)
   if st == NATS_OK: sub[] = handle
   st
@@ -238,6 +245,8 @@ proc msgHandle(m: core.Message): ptr natsMsg =
 proc natsConnection_Request*(msg: ptr ptr natsMsg, conn: ptr natsConnection,
                              subject, data: cstring, dataLen: cint,
                              timeoutMs: int64): natsStatus {.discardable.} =
+  if msg == nil: return setErr("request: nil output pointer")
+  msg[] = nil
   let c = rawConn(conn)
   if c == nil: return setErr("natsConnection_Request: nil connection")
   try:
@@ -260,12 +269,17 @@ proc natsConnection_Request*(msg: ptr ptr natsMsg, conn: ptr natsConnection,
 proc natsSubscription_NextMsg*(msg: ptr ptr natsMsg,
                                sub: ptr natsSubscription,
                                timeoutMs: int64): natsStatus {.discardable.} =
+  if msg == nil: return setErr("nextMsg: nil output pointer")
+  msg[] = nil
   if sub == nil or sub.impl == nil:
     return setErr("natsSubscription_NextMsg: nil subscription")
   try:
     let m = sub.impl.nextMsg(timeoutMs.int)
     msg[] = msgHandle(m)
     NATS_OK
+  except NoRespondersError as e:
+    lastErrorText = e.msg
+    NATS_NO_RESPONDERS
   except NatsTimeout:
     NATS_TIMEOUT
   except CatchableError as e:
@@ -278,18 +292,11 @@ proc natsSubscription_Unsubscribe*(sub: ptr natsSubscription): natsStatus {.disc
   NATS_OK
 
 proc natsSubscription_Destroy*(sub: ptr natsSubscription) =
-  ## Detach (unsubscribe); the handle itself is reclaimed by the collector once
-  ## the caller drops it.
-  ##
-  ## **Deviates from nats.c, matches natswrapper**: nats.c returns a status
-  ## here, natswrapper's Futhark binding does not — and Niffler relies on that
-  ## (`defer: natsSubscription_Destroy(sub)`). Detaching cannot fail in this
-  ## implementation, so void is also the honest signature.
-  if sub == nil or sub.impl == nil:
-    lastErrorText = "natsSubscription_Destroy: nil subscription"
-    return
-  sub.impl.unsubscribe()
-  sub.impl = nil
+  ## Unsubscribe and free the handle. Void, as in nats.c. Nil is harmless.
+  if sub == nil: return
+  if sub.impl != nil: sub.impl.unsubscribe()
+  reset(sub[])
+  dealloc(sub)
 
 proc natsMsg_GetData*(msg: ptr natsMsg): cstring =
   if msg == nil: "" else: msg.data.cstring
@@ -309,6 +316,7 @@ proc natsMsg_GetHeader*(msg: ptr natsMsg): cstring =
   if msg == nil: "" else: msg.headers.cstring
 
 proc natsMsg_Destroy*(msg: ptr natsMsg) =
-  ## No-op: messages are GC-managed (see the module header). Kept so callers
-  ## ported from `nats.c` keep compiling and reading naturally.
-  discard msg
+  ## Release owned strings and the raw handle. Accessors expire at this call.
+  if msg == nil: return
+  reset(msg[])
+  dealloc(msg)

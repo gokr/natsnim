@@ -11,8 +11,8 @@
 ##    allocations, with `cloneMsgArg` to escape the read buffer's lifetime.
 ##    Here split arguments and split payloads accumulate in Nim strings, and
 ##    `MsgArgs` fields are always owned copies — so `cloneMsgArg` has no
-##    counterpart and `MAX_CONTROL_LINE_SIZE` is not enforced (Go does not
-##    enforce it either; the connection layer may, later).
+##    counterpart. Explicit control-line and payload limits reject oversized
+##    frames before buffering them.
 ##  - **The payload is always copied** into a fresh string, where Go may hand
 ##    the handler a slice of the read buffer. A message that spans reads is
 ##    therefore assembled in `msgBuf` in both implementations.
@@ -23,7 +23,9 @@
 ##    numeric state matches upstream (`fail` prints it).
 
 
-const MAX_CONTROL_LINE_SIZE* = 4096
+const
+  MAX_CONTROL_LINE_SIZE* = 4096
+  defaultMaxInboundPayload* = 16 * 1024 * 1024
 
 type
   PState* = enum
@@ -54,6 +56,9 @@ type
 
   Parser* = object
     state*: PState
+    maxControlLine: int
+    maxPayload: int
+    controlBytes: int
     hdr: int
     argStart: int    ## start of the current argument
     drop: int      ## 1 when a '\r' must be dropped before the '\n'
@@ -69,14 +74,14 @@ proc hasArgBuf*(p: Parser): bool = p.argActive
 proc hasMsgBuf*(p: Parser): bool = p.msgActive
   ## The port of a Go test's `ps.msgBuf != nil`.
 
-proc initParser*(): Parser =
-  Parser(state: OP_START, hdr: 0, ma: MsgArgs(hdr: 0))
+proc initParser*(maxControlLine = MAX_CONTROL_LINE_SIZE,
+                 maxPayload = defaultMaxInboundPayload): Parser =
+  if maxControlLine <= 0 or maxPayload <= 0 or maxPayload > high(int) div 2:
+    raise newException(ValueError, "invalid parser limits")
+  Parser(state: OP_START, hdr: 0, ma: MsgArgs(hdr: 0),
+         maxControlLine: maxControlLine, maxPayload: maxPayload)
 
 # --- argument parsing -------------------------------------------------------
-
-const
-  argsLenMax = 4
-  hdrArgsLenMax = 5
 
 proc splitArgs(arg: string): seq[string] =
   ## Whitespace-split as upstream: separators are ' ', '\t', '\r' and '\n',
@@ -99,8 +104,14 @@ proc parseInt64*(d: string): int64 =
   var n = 0'i64
   for dec in d:
     if dec < '0' or dec > '9': return -1
-    n = n * 10 + (int64(ord(dec)) - 48)
+    let digit = int64(ord(dec)) - 48
+    if n > (high(int64) - digit) div 10: return -1
+    n = n * 10 + digit
   n
+
+proc boundedSize(d: string, limit: int): int =
+  let n = parseInt64(d)
+  if n < 0 or n > limit: -1 else: n.int
 
 proc processHeaderMsgArgs(p: var Parser, arg: string): string =
   let args = splitArgs(arg)
@@ -109,14 +120,14 @@ proc processHeaderMsgArgs(p: var Parser, arg: string): string =
     p.ma.subject = args[0]
     p.ma.sid = parseInt64(args[1])
     p.ma.reply = ""
-    p.ma.hdr = parseInt64(args[2]).int
-    p.ma.size = parseInt64(args[3]).int
+    p.ma.hdr = boundedSize(args[2], p.maxPayload)
+    p.ma.size = boundedSize(args[3], p.maxPayload)
   of 5:
     p.ma.subject = args[0]
     p.ma.sid = parseInt64(args[1])
     p.ma.reply = args[2]
-    p.ma.hdr = parseInt64(args[3]).int
-    p.ma.size = parseInt64(args[4]).int
+    p.ma.hdr = boundedSize(args[3], p.maxPayload)
+    p.ma.size = boundedSize(args[4], p.maxPayload)
   else:
     return "nats: processHeaderMsgArgs Parse Error: '" & arg & "'"
   if p.ma.sid < 0:
@@ -137,12 +148,12 @@ proc processMsgArgs*(p: var Parser, arg: string): string =
     p.ma.subject = args[0]
     p.ma.sid = parseInt64(args[1])
     p.ma.reply = ""
-    p.ma.size = parseInt64(args[2]).int
+    p.ma.size = boundedSize(args[2], p.maxPayload)
   of 4:
     p.ma.subject = args[0]
     p.ma.sid = parseInt64(args[1])
     p.ma.reply = args[2]
-    p.ma.size = parseInt64(args[3]).int
+    p.ma.size = boundedSize(args[3], p.maxPayload)
   else:
     return "nats: processMsgArgs Parse Error: '" & arg & "'"
   if p.ma.sid < 0:
@@ -164,6 +175,11 @@ proc parse*(p: var Parser, buf: string, sink: Sink): string =
   var i = 0
   while i < buf.len:
     let b = buf[i]
+    if p.state != MSG_PAYLOAD:
+      inc p.controlBytes
+      if p.controlBytes > p.maxControlLine:
+        return "nats: control line exceeds limit"
+      if b == '\n': p.controlBytes = 0
     case p.state
     of OP_START:
       case b
@@ -219,7 +235,8 @@ proc parse*(p: var Parser, buf: string, sink: Sink): string =
         p.state = MSG_PAYLOAD
         # Jump ahead: the payload follows immediately. If this overruns what
         # is left, the loop falls out and the post-loop handles the split.
-        i = p.argStart + p.ma.size - 1
+        # Bound arithmetic by this buffer, not an attacker-controlled size.
+        i = p.argStart + min(p.ma.size, buf.len - p.argStart) - 1
       else:
         if p.argActive: p.argBuf.add(b)
     of MSG_PAYLOAD:
