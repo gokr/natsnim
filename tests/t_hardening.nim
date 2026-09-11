@@ -202,6 +202,68 @@ proc runBusTests() =
         check s.nextMsg(2000).data == $got
         inc got
 
+    test "batched publishes coalesce and arrive complete and in order":
+      let c = core.dial(srv.url)
+      defer: c.close()
+      let s = c.subscribe("bat")
+      c.flush()
+      c.deferFlush()
+      check c.unflushedBytes == 0
+      for i in 0 ..< 500:
+        c.publish("bat", "m" & $i)
+      check c.unflushedBytes > 0        # nothing written during the batch
+      c.flushOutbound()
+      check c.unflushedBytes == 0
+      for i in 0 ..< 500:
+        check s.nextMsg(2000).data == "m" & $i
+
+    test "the batch template flushes on block exit and on exceptions":
+      let c = core.dial(srv.url)
+      defer: c.close()
+      let s = c.subscribe("bat2")
+      c.flush()
+      c.batch:
+        for i in 0 ..< 100:
+          c.publish("bat2", "b" & $i)
+      check c.unflushedBytes == 0
+      for i in 0 ..< 100:
+        check s.nextMsg(2000).data == "b" & $i
+      try:
+        c.batch:
+          c.publish("bat2", "x")
+          raise newException(ValueError, "boom")
+      except ValueError: discard
+      check c.unflushedBytes == 0       # flushed even when the block raised
+      check s.nextMsg(2000).data == "x"
+
+    test "batched publishes survive an outage via the reconnect buffer":
+      var bus = startServer()
+      defer: bus.stop()
+      var opts = core.defaultDialOptions()
+      opts.reconnectWaitMs = 0
+      opts.reconnectJitterMs = 0
+      let c = core.dial(bus.url, opts)
+      defer: c.close()
+      let s = c.subscribe("bat.out")
+      c.flush()
+      c.deferFlush()
+      for i in 0 ..< 10: c.publish("bat.out", $i)
+      check c.unflushedBytes > 0
+      bus.stopServerProcess()
+      # Notice the outage through a pure read (pump never flushes), so the
+      # batch is still unwritten when the disconnect salvages it. Writing a
+      # batch into a socket whose peer already died would be real TCP loss —
+      # no client can prevent that.
+      expect core.NatsError:
+        discard c.pump(500)
+      check not c.connected
+      check c.bufferedBytes > 0
+      bus.startServerProcess()
+      c.flush(8000)
+      check c.connected
+      for i in 0 ..< 10:
+        check s.nextMsg(2000).data == $i
+
     test "simultaneous server fixtures do not share directories or ports":
       let other = startServer()
       defer: other.stop()

@@ -5,12 +5,15 @@
 ## One connection belongs to one thread. Close connections explicitly.
 ## Reconnect progresses across even zero/one-ms polls without a blocking dial.
 ##
-## Writes: a publish is on the wire (within its write budget) when it returns
-## — there is no flusher thread to defer it, and callers must not need a
-## follow-up operation to push their data. The reused output buffer avoids a
-## fresh frame concatenation per publish; multi-frame operations (request's
-## SUB+PUB, batched PONG replies) coalesce into one write internally, and
-## publishes accepted during an outage are buffered for the reconnect.
+## Writes: by default a publish is on the wire (within its write budget) when
+## it returns — there is no flusher thread to defer it, and callers must not
+## need a follow-up operation to push their data. Bulk publishers can opt
+## into batching (`deferFlush`/`flushOutbound` or the `batch` template): N
+## publishes then cost one send at the end of the batch. The reused output
+## buffer avoids a fresh frame concatenation per publish; multi-frame
+## operations (request's SUB+PUB, batched PONG replies) coalesce into one
+## write internally, and publishes accepted during an outage are buffered
+## for the reconnect.
 
 import std/[deques, json, monotimes, nativesockets, net, os, random, strutils,
             tables, times, uri]
@@ -32,6 +35,10 @@ const
   directWriteMin = 16 * 1024
     ## Payloads at least this large bypass the buffer: one kernel copy beats
     ## buffer-copy plus kernel-copy for big frames.
+  outBufCap = 64 * 1024 * 1024
+    ## Memory bound for batch mode: a batch that appends past this is flushed
+    ## mid-batch (one large write carries it), so callers cannot balloon the
+    ## buffer by deferring indefinitely.
   crlf = "\r\n"
 
 type
@@ -104,6 +111,7 @@ type
     pendingStaged: int      ## bytes of `pending` staged into the current replay
     outBuf: string          ## output buffer: publishes awaiting one write
     outOffset: int
+    batchDepth: int         ## > 0 while publishes defer their flush
     rng: Rand
     ids: NuID
     errors: Deque[string]
@@ -198,6 +206,7 @@ proc noteDisconnect(c: Connection, reason: string) =
       c.pendingSize += c.outBuf.len - c.outOffset
   c.outBuf.setLen(0)
   c.outOffset = 0
+  c.batchDepth = 0
   c.nextAttemptAt = getMonoTime() + initDuration(
     milliseconds = reconnectDelayMs(c.opts, c.rng))
 proc outageReason(c: Connection): string =
@@ -274,6 +283,34 @@ proc sendNow(c: Connection, data: string, deadline: MonoTime) =
   ## PING/PONG frames never overtake publishes issued before them.
   c.flushOut(deadline)
   c.sendBytes(data, deadline)
+
+proc deferFlush*(c: Connection) =
+  ## Start (or nest) batch mode: publishes are appended to the connection's
+  ## output buffer instead of being written immediately, so N publishes cost
+  ## one send. Memory stays bounded (auto-flush at 64 MiB mid-batch), and any
+  ## read/wait (`nextMsg`, `flush`, `request`) flushes what is pending —
+  ## batch mode only defers the *automatic* write, never delivery itself.
+  ## Pair with `flushOutbound`, or use the `batch` template, which cannot
+  ## forget it.
+  inc c.batchDepth
+
+proc flushOutbound*(c: Connection) =
+  ## Write everything buffered in one send; leave batch mode if this call is
+  ## the pair for a `deferFlush` (nesting-safe). Safe to call anytime: a no-op
+  ## when nothing is buffered. Raises a transport error if the write fails;
+  ## the unwritten remainder is then salvaged into the reconnect buffer.
+  if c.batchDepth > 0: dec c.batchDepth
+  c.flushOut(untilMs(c.opts.writeTimeoutMs))
+
+template batch*(c: Connection, body: untyped) =
+  ## Sugar over `deferFlush`/`flushOutbound`: publishes inside the block
+  ## coalesce into one write at block exit — also when the block raises.
+  ## Nesting is supported (the innermost exit flushes its share).
+  c.deferFlush()
+  try:
+    body
+  finally:
+    c.flushOutbound()
 
 proc releaseBytes(s: Subscription, count: int) =
   s.bytes -= count
@@ -568,6 +605,7 @@ proc close*(c: Connection) =
   c.outgoing.setLen(0)
   c.outBuf.setLen(0)
   c.outOffset = 0
+  c.batchDepth = 0
   c.sink = Sink()       # break connection -> sink -> connection
   c.readBuf.setLen(0)
 
@@ -659,6 +697,8 @@ proc stagePublish(c: Connection, h, data: string, deadline: MonoTime) =
     c.outBuf.add(h)
     c.outBuf.add(data)
     c.outBuf.add(crlf)
+    if c.batchDepth > 0 and c.outBuf.len >= outBufCap:
+      c.flushOut(deadline)    # bound a long batch's memory
 
 proc publishRaw(c: Connection, subject, reply, data: string, deadline: MonoTime) =
   if c.closed: fail("connection is closed")
@@ -677,7 +717,8 @@ proc publishRaw(c: Connection, subject, reply, data: string, deadline: MonoTime)
     # request/reply patterns deadlock-free. The reused output buffer avoids
     # a fresh concatenation per publish; large payloads skip even its copy.
     c.stagePublish(h, data, deadline)
-    c.flushOut(deadline)
+    if c.batchDepth == 0:
+      c.flushOut(deadline)
     return
   if c.phase == offline and not c.reconnectEligible(): fail("publish: " & c.outageReason())
   let frameLen = h.len + data.len + 2

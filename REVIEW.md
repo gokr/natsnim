@@ -268,8 +268,12 @@ retired:
   into a reused output buffer (no per-publish concatenation), payloads ≥ 16
   KiB on an empty buffer bypass it entirely, and multi-frame operations
   coalesce into one write. Cross-call batching like nats.go's was attempted
-  and rejected: without a flusher thread it deadlocks "publish on A, read on
-  B" patterns (pinned by a regression test); publish now writes through.
+  and rejected for the **default**: without a flusher thread it deadlocks
+  "publish on A, read on B" patterns (pinned by a regression test), so
+  publish writes through. Batching returned as an opt-in API
+  (`deferFlush`/`flushOutbound`, sugar via the `batch` template) — with it
+  the publisher path reaches parity with nats.go in the head-to-head
+  (~1.0M vs ~1.13M msgs/s into a Go subscriber).
 - ~~`deliver` constructs/splits a message before checking pending
   capacity~~ — fixed: limits are checked before any message allocation.
 - ~~`waitReadable` treats EINTR as a dead connection~~ — fixed: EINTR retries

@@ -157,15 +157,31 @@ What is still batched, internally and without changing that contract:
   buffered (bounded, see *Reconnect*) and replayed in order after the
   reconnect, together with the resubscriptions.
 
-The performance consequence is measured in a head-to-head against `nats.go`
-(on loopback, medians of several rounds): connect/handshake and small
+Bulk publishers that want Go's batching opt in explicitly:
+
+```nim
+c.batch:                       # sugar over deferFlush/flushOutbound,
+  for item in items:           # exception-safe and nesting-safe
+    c.publish("events.bulk", encode(item))
+# one send carries the whole batch here
+```
+
+`c.deferFlush()` / `c.flushOutbound()` are the explicit pair (shape 2 above
+is only sugar over them). Inside a batch, publishes append to the output
+buffer — memory-bounded, auto-flushed at 64 MiB — and any read/wait still
+flushes what is pending: batching defers the automatic write, never delivery
+itself. The default without batching is unchanged (write-through).
+
+The performance consequence, measured head-to-head against `nats.go` on
+loopback (medians of several rounds): connect/handshake and small
 request/reply are at parity or faster; large-payload request/reply runs
-~1.6–2.2× slower (the parser hands out owned payload copies rather than
-borrowing its read buffer); sustained publish fan-out is several times
-slower — one write syscall per publish instead of Go's batched background
-flushes. That last gap is the direct price of the no-thread design above;
-closing it would require either a flusher thread or an explicit
-batch-and-flush API, both deliberate non-goals for now.
+~1.6–2.6× slower (the parser hands out owned payload copies rather than
+borrowing its read buffer). Sustained fan-out with the default write-through
+is several times slower than Go; with the batch API the publisher path
+reaches parity — feeding a Go subscriber, the batched Nim publisher
+sustained ~1.0M msgs/s against ~1.13M for Go's own publisher — while
+end-to-end fan-out through this client's subscriber remains bounded by the
+owned-copy cost above (~1.4× slower than Go's subscriber).
 
 ## Threading
 
