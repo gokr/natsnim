@@ -172,16 +172,38 @@ buffer — memory-bounded, auto-flushed at 64 MiB — and any read/wait still
 flushes what is pending: batching defers the automatic write, never delivery
 itself. The default without batching is unchanged (write-through).
 
-The performance consequence, measured head-to-head against `nats.go` on
-loopback (medians of several rounds): connect/handshake and small
-request/reply are at parity or faster; large-payload request/reply runs
-~1.6–2.6× slower (the parser hands out owned payload copies rather than
-borrowing its read buffer). Sustained fan-out with the default write-through
-is several times slower than Go; with the batch API the publisher path
-reaches parity — feeding a Go subscriber, the batched Nim publisher
-sustained ~1.0M msgs/s against ~1.13M for Go's own publisher — while
-end-to-end fan-out through this client's subscriber remains bounded by the
-owned-copy cost above (~1.4× slower than Go's subscriber).
+The performance consequence is quantified in the next section.
+
+## Head-to-head against nats.go
+
+One representative run of `bench/compare` (loopback, one connection pair,
+medians of 3 rounds, Nim `-d:release`, Go default build, `nats.go v1.41.1`).
+Absolute numbers are hardware- and load-sensitive — compare within a run;
+regenerate on your own hardware with `python3 bench/compare/run.py`.
+
+| scenario | natsnim | nats.go | ratio |
+|---|---|---|---|
+| connect + handshake + close | 190 µs | 232 µs | natsnim faster |
+| request/reply, 128 B | 73 µs | 77 µs | parity, natsnim ahead |
+| request/reply, 64 KiB | 479 µs | 278 µs | nats.go 1.7× |
+| request/reply, 512 KiB | 2.94 ms | 1.14 ms | nats.go 2.6× |
+| fan-out 256 B, batched pub → go sub | 1,533,860 msgs/s | 1,704,303 msgs/s (go pub → go sub) | ~parity (90%) |
+| fan-out 256 B, batched pub → natsnim sub | 1,132,310 msgs/s | 1,305,057 msgs/s (go pub → natsnim sub) | nats.go 1.15× |
+| fan-out 256 B, write-through pub (default) | 182,066 msgs/s | — | the batching delta (~8×) |
+
+Reading:
+
+- **Publisher path: parity with the batch API.** The batched Nim publisher
+  into a Go subscriber sustains ~90% of Go-pub→Go-sub; both write large
+  bursts in few syscalls.
+- **Subscriber path: ~1.3–1.5× behind.** The parser hands out owned payload
+  copies (a safety choice) where Go borrows its read buffer.
+- **Large payloads** share that root cause (~1.7–2.6×).
+- **Small request/reply and connect: parity or better** — the shape real
+  request/response bus traffic has.
+- The default write-through publish trades fan-out throughput for the
+  on-return guarantee described above; opt into `batch` when a workload is
+  bulk-publish bound.
 
 ## Threading
 

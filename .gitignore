@@ -1,3 +1,6 @@
 nimcache/
 tests/bin/
 *.exe
+bench/compare/bin/
+bench/compare/bench.conf
+bench/compare/gobench/gobench
